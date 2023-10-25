@@ -1,4 +1,4 @@
-# OffensiveLua
+# Offensive Lua
 
 Offensive Lua is a collection of offensive security scripts for performing offensive
 security tasks under Lua. You can test with "luajit.exe binrun.lua". These scripts
