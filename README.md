@@ -9,8 +9,8 @@ run with Lua and FFI under Microsoft Windows to perform common operations such a
 * Exploit File or Registry
 * Common Tasks
 
-Lua is a lesser used but useful post-exploitation script choice, this repository contains
-common malicious behaviors that you may wish to achieve using Lua w/FFI on Windows hosts.
+Lua is a lesser used but useful post-exploitation scripting language, this repository contains
+common actions that you may wish to achieve using Lua w/FFI on Windows hosts. 
 
 | Filename | Description |
 | :---: | :--- |
