@@ -1,4 +1,4 @@
-# OffensiveLua
+# Offensive Lua
 
 Offensive Lua is a collection of offensive security scripts for performing offensive
 security tasks under Lua. You can test with "luajit.exe binrun.lua". These scripts
@@ -20,7 +20,7 @@ common actions that you may wish to achieve using Lua w/FFI on Windows hosts.
 | ComputerDefaultsUACBypass.lua  | Bypass UAC restrictions via ms-settings             |
 |          console.lua           | Console App Example                                 |
 |        downloadexec.lua        | Download & Exec over HTTP                           |
-|   downloadexec_UACbypass.lua   | Download & Exec & BypassUAC over HTTP               |
+|   downloadexec_UACbypass.lua   | Download & BypassUAC & Exec over HTTP               |
 |         filewrite.lua          | Write a file                                        |
 |           luajit.exe           | LuaJIT compiled from our internal source tree.      |
 |         messagebox.lua         | MessageBox Example                                  |
