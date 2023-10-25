@@ -1,3 +1,4 @@
+-- bind cmd.exe on TCP port 5000
 local ffi = require("ffi")
 local io = require("io")
 
