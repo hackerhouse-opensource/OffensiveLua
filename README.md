@@ -16,6 +16,7 @@ common actions that you may wish to achieve using Lua w/FFI on Windows hosts.
 | :----------------------------: | :-------------------------------------------------- |
 |          bin2hex.lua           | Convert a binary to hex for binrun.lua              |
 |           binrun.lua           | Writes a hex of EXE to a random location and exec's |
+|         bindshell.lua          | bind a shell on TCP port 5000                       |
 | ComputerDefaultsUACBypass.lua  | Bypass UAC restrictions via ms-settings             |
 |          console.lua           | Console App Example                                 |
 |        downloadexec.lua        | Download & Exec over HTTP                           |
