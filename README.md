@@ -1,7 +1,16 @@
 # OffensiveLua
 
 Offensive Lua is a collection of offensive security scripts for performing offensive
-security objectives under Lua. You can test with "luajit.exe binrun.lua". 
+security tasks under Lua. You can test with "luajit.exe binrun.lua". These scripts 
+run with Lua and FFI under Microsoft Windows to perform common operations such as:
+
+* Run an EXE
+* Bypass UAC
+* Exploit File or Registry
+* Common Tasks
+
+Lua is a lesser used but useful post-exploitation script choice, this repository contains
+common malicious behaviors that you may wish to achieve using Lua w/FFI on Windows hosts.
 
 | Filename | Description |
 | :---: | :--- |
