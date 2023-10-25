@@ -9,8 +9,8 @@ The scripts run with LuaJIT (v2.0.5) on Microsoft Windows to perform common task
 - Common Tasks (e.g. bind a shell)
 
 Lua is a lesser used but very useful choice for post-exploitation scripting language. It's
-flexible, lightweight, easy to embed, runs interpreted or bytecode from memory and allows JIT
-to interact with the host OS libraries. 
+flexible, lightweight, easy to embed, runs interpreted or as bytecode from memory and allows 
+for JIT to interact with the host OS libraries. 
 
 |            Filename            | Description                                         |
 | :----------------------------: | :-------------------------------------------------- |
