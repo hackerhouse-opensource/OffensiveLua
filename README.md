@@ -8,10 +8,9 @@ The scripts run with LuaJIT (v2.0.5) on Microsoft Windows to perform common task
 - File, Networking or Registry
 - Common Tasks (e.g. bind a shell)
 
-Lua is a lesser used but very useful choice for post-exploitation scripting language for
-numerous reasons, it's bytecode interpreted via a virtual machine, supports JIT to native, 
-this repository contains common actions that you may wish to achieve using Lua w/FFI on
-Windows.
+Lua is a lesser used but very useful choice for post-exploitation scripting language. It's
+flexible, lightweight, easy to embed, runs interpreted or bytecode from memory and allows JIT
+to interact with the host OS libraries. 
 
 |            Filename            | Description                                         |
 | :----------------------------: | :-------------------------------------------------- |
