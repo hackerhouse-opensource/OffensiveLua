@@ -43,6 +43,29 @@ function GetLastError()
     return kernel32.GetLastError()
 end
 
+-- convert SID to standard SID notation
+function ConvertBinarySIDToStandardNotation(binarySid)
+    -- The binary SID should be a byte array.
+    local sidString = "S"
+    -- Extract revision and authority fields.
+    local revision = binarySid[1]
+    local authority = binarySid[7] + (binarySid[6] * 256) + (binarySid[5] * 256 * 256) + (binarySid[4] * 256 * 256 * 256) + (binarySid[3] * 256 * 256 * 256 * 256) + (binarySid[2] * 256 * 256 * 256 * 256 * 256)
+    -- Add the revision and authority to the SID string.
+    sidString = sidString .. "-" .. revision .. "-" .. authority
+    -- Iterate through the binary SID and extract subauthorities.
+    local subauthorities = {}
+    for i = 9, 68, 4 do
+        local subauth = binarySid[i] + (binarySid[i + 1] * 256) + (binarySid[i + 2] * 256 * 256) + (binarySid[i + 3] * 256 * 256 * 256)
+        table.insert(subauthorities, subauth)
+    end
+    -- Add the subauthorities to the SID string.
+    for _, subauth in ipairs(subauthorities) do
+        sidString = sidString .. "-" .. subauth
+    end
+    return sidString
+end
+
+-- GetUsernameAndSid
 function GetUsernameAndSID(pid)
     local processHandle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid)
     if processHandle == nil then
@@ -71,11 +94,8 @@ function GetUsernameAndSID(pid)
 
         if advapi32.LookupAccountSidA(nil, tokenUser.UserSid, name, nameSize, domain, domainSize, peUse) ~= 0 then
             print("Username: " .. ffi.string(name))
-            local sidOutput = "SID: "
-        for i = 1, ffi.sizeof(tokenUser.UserSid) do
-            sidOutput = sidOutput .. string.format("%02X", tokenUser.UserSid[i])
-        end
-        print(sidOutput)
+            local sidOutput = ConvertBinarySIDToStandardNotation(tokenUser.UserSid)
+            print("SID: " .. sidOutput)
         else
             print("LookupAccountSidA failed, error code: " .. GetLastError())
         end
