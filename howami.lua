@@ -30,6 +30,7 @@ ffi.cdef[[
     void CloseHandle(HANDLE hObject);
     void SetLastError(DWORD dwErrCode);
     int LookupAccountSidA(const char* lpSystemName, const char* Sid, char* Name, DWORD* cchName, char* ReferencedDomainName, DWORD* cchReferencedDomainName, int* peUse);
+    DWORD GetLastError();
 ]]
 
 local PROCESS_QUERY_INFORMATION = 0x0400
