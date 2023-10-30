@@ -1,6 +1,6 @@
 # Offensive Lua
 
-Offensive Lua is a collection of offensive security scripts written in Lua with FFI. 
+Offensive Lua is a collection of offensive security scripts written in Lua with FFI.
 The scripts run with LuaJIT (v2.0.5) on Microsoft Windows to perform common tasks.
 
 - Run an EXE
@@ -9,8 +9,8 @@ The scripts run with LuaJIT (v2.0.5) on Microsoft Windows to perform common task
 - Common Tasks (e.g. bind a shell)
 
 Lua is a lesser used but very useful choice for post-exploitation scripting language. It's
-flexible, lightweight, easy to embed, runs interpreted or as bytecode from memory and allows 
-for JIT to interact with the host OS libraries. 
+flexible, lightweight, easy to embed, runs interpreted or as bytecode from memory and allows
+for JIT to interact with the host OS libraries.
 
 |            Filename            | Description                                         |
 | :----------------------------: | :-------------------------------------------------- |
@@ -22,6 +22,7 @@ for JIT to interact with the host OS libraries.
 |        downloadexec.lua        | Download & Exec over HTTP                           |
 |   downloadexec_UACbypass.lua   | Download & BypassUAC & Exec over HTTP               |
 |         filewrite.lua          | Write a file                                        |
+|           howami.lua           | Always whoami.exe never howami.lua                  |
 |           luajit.exe           | LuaJIT compiled from our internal source tree.      |
 |         messagebox.lua         | MessageBox Example                                  |
 |          regread.lua           | Read from Registry                                  |
