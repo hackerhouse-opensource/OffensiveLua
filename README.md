@@ -11,8 +11,8 @@ The scripts run with LuaJIT on Microsoft Windows to perform common red teaming t
 
 Lua is a lesser used but very useful choice for post-exploitation scripting language. It's
 flexible, lightweight, easy to embed, runs interpreted or as bytecode from memory and allows
-for JIT to interact with the host OS libraries. It is also trivial to obfuscate before,
-can be executed from memory and is generally very fast.
+for JIT to interact with the host OS libraries. It is also trivial to obfuscate and is
+very fast to learn and adapt.
 
 |            Filename            | Description                                         |
 | :----------------------------: | :-------------------------------------------------- |
