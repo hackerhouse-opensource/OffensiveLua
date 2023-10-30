@@ -1,3 +1,4 @@
+-- howami.lua function to simulate "whoami.exe" and list username, SID & privileges.
 local ffi = require("ffi")
 local kernel32 = ffi.load("kernel32")
 local advapi32 = ffi.load("advapi32")
