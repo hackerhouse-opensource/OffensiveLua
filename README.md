@@ -1,16 +1,18 @@
 # Offensive Lua
 
 Offensive Lua is a collection of offensive security scripts written in Lua with FFI.
-The scripts run with LuaJIT (v2.0.5) on Microsoft Windows to perform common tasks.
+The scripts run with LuaJIT on Microsoft Windows to perform common red teaming tasks.
 
-- Run an EXE
+- Download and/or Run an EXE
 - Bypass UAC
-- File, Networking or Registry
-- Common Tasks (e.g. bind a shell)
+- File, Networking or Registry access
+- Bind a shell
+- whoami.exe alternatives
 
 Lua is a lesser used but very useful choice for post-exploitation scripting language. It's
 flexible, lightweight, easy to embed, runs interpreted or as bytecode from memory and allows
-for JIT to interact with the host OS libraries.
+for JIT to interact with the host OS libraries. It is also trivial to obfuscate before,
+can be executed from memory and is generally very fast.
 
 |            Filename            | Description                                         |
 | :----------------------------: | :-------------------------------------------------- |
@@ -33,6 +35,10 @@ for JIT to interact with the host OS libraries.
 |          runcmd2.lua           | Run a command os.execute                            |
 |         runswhide.lua          | Run a command via CreateProcess with SW_HIDE        |
 | uac_bypass_bluetooth_win10.lua | Bypass UAC via Bluetooth on Windows10               |
+
+You can learn more about Hacker House and Offensive Lua at our website:
+
+- https://hacker.house/services
 
 # License
 
