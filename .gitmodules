@@ -1,0 +1,3 @@
+[submodule "OffensiveLuaEmbedded/luajit"]
+	path = OffensiveLuaEmbedded/luajit
+	url = https://github.com/LuaJIT/LuaJIT

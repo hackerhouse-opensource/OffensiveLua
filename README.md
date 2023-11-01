@@ -38,6 +38,15 @@ very fast to learn and adapt.
 |         runswhide.lua          | Run a command via CreateProcess with SW_HIDE        |
 | uac_bypass_bluetooth_win10.lua | Bypass UAC via Bluetooth on Windows10               |
 
+
+# OffensiveLuaEmbedded
+
+An example visual studio 2022 project that can be used to embed LuaJIT into a binary for 
+the purposes of running scripts. You will need to checkout the git submodules to get
+the latest LuaJIT branch. 
+
+# More
+
 You can learn more about Hacker House and Offensive Lua at our website:
 
 - https://hacker.house/services
