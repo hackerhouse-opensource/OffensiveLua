@@ -23,6 +23,8 @@ very fast to learn and adapt.
 |          console.lua           | Console App Example                                 |
 |        downloadexec.lua        | Download & Exec over HTTP                           |
 |   downloadexec_UACbypass.lua   | Download & BypassUAC & Exec over HTTP               |
+|         efspotato.lua          | Incomplete efspotato                                |
+|         eventcode.lua          | Example of Windows Event handler                    |
 |         filewrite.lua          | Write a file                                        |
 |           howami.lua           | Always whoami.exe never howami.lua                  |
 |           luajit.exe           | LuaJIT compiled from our internal source tree.      |
