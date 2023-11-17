@@ -65,7 +65,24 @@ DWORD GetLastError(void);
 local TH32CS_SNAPPROCESS = 0x00000002
 local INVALID_HANDLE_VALUE = ffi.cast("HANDLE", -1)
 
-function searchProcess(pid)
+-- hexdump a buffer
+function hexdump(address, buffer, size)
+    local hexLine = ""
+    local asciiLine = ""
+    for i = 0, size - 1 do
+        local byte = string.byte(ffi.string(buffer, size), i + 1)
+        hexLine = hexLine .. string.format("%02X ", byte)
+        asciiLine = asciiLine .. (byte >= 32 and byte <= 126 and string.char(byte) or ".")
+        if (i + 1) % 16 == 0 or (i == size - 1) then
+            print(string.format("%s  %s", hexLine, asciiLine))
+            hexLine = ""
+            asciiLine = ""
+        end
+    end
+end
+
+-- searchProcess pid for string
+function searchProcess(pid,searchstr)
     local hProcess = kernel32.OpenProcess(kernel32.PROCESS_VM_READ + kernel32.PROCESS_QUERY_INFORMATION, false, pid)
     if hProcess == nil then
         local errorCode = kernel32.GetLastError()
@@ -91,9 +108,9 @@ function searchProcess(pid)
             else
                 --print("Reading 0x" .. string.format("%p", address) .. " read: " .. string.format("%d", bytesRead[0]))
                 local str = ffi.string(buffer, bytesRead[0])
-                if string.find(string.lower(str), "password") then
-                    print("Found 'password' at address: ", address)
-                    print("String at address: ", str)
+                if string.find(string.lower(str), searchstr) then
+                    print("Found '" .. searchstr .. "' at address: " .. string.format("%p", address))
+                    hexdump(address, buffer, bytesRead[0])
                 end
             end
             address = ffi.cast("char*", address) + bufferSize
