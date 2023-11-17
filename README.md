@@ -5,7 +5,7 @@ The scripts run with LuaJIT on Microsoft Windows to perform common red teaming t
 
 - Download and/or Run an EXE
 - Bypass UAC
-- File, Networking or Registry access
+- Files, Memory, Networking & Registry
 - Bind a shell
 - whoami.exe alternatives
 
@@ -28,6 +28,7 @@ very fast to learn and adapt.
 |         filewrite.lua          | Write a file                                        |
 |           howami.lua           | Always whoami.exe never howami.lua                  |
 |           luajit.exe           | LuaJIT compiled from our internal source tree.      |
+|        memorysearch.lua        | searches memory for passwords                       |
 |         messagebox.lua         | MessageBox Example                                  |
 |          regread.lua           | Read from Registry                                  |
 |          regwrite.lua          | Write to Registry                                   |
@@ -38,12 +39,11 @@ very fast to learn and adapt.
 |         runswhide.lua          | Run a command via CreateProcess with SW_HIDE        |
 | uac_bypass_bluetooth_win10.lua | Bypass UAC via Bluetooth on Windows10               |
 
-
 # OffensiveLuaEmbedded
 
-An example visual studio 2022 project that can be used to embed LuaJIT into a binary for 
+An example visual studio 2022 project that can be used to embed LuaJIT into a binary for
 the purposes of running scripts. You will need to checkout the git submodules to get
-the latest LuaJIT branch. 
+the latest LuaJIT branch.
 
 # More
 
