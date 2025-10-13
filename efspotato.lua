@@ -438,4 +438,4 @@ local function GetSystem(command, endpointPipeName)
 end
 
 -- Call the GetSystem function
-GetSystem("c:\\Users\\Fantastic\\Desktop\\DEMO\\Renge_x64.exe", "efsrpc")
+GetSystem("c:\\temp\\somefile.bat", "efsrpc")
