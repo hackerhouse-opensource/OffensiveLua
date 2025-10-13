@@ -1,4 +1,6 @@
 // OffensiveLuaEmbedded.cpp : Advanced LuaJIT script debugger utility.
+#define OFFENSIVE_LUAJIT_VERSION "v0.01"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -1578,12 +1580,18 @@ void printUsage()
 	std::cout << "Usage: luadebug [options] <script.lua> [args...]" << std::endl;
 	std::cout << "Options:" << std::endl;
 	std::cout << "  --interactive, -i      Enable interactive debugging mode." << std::endl;
-	std::cout << "  --dump-bytecode        Create .lbin bytecode file with hexdump." << std::endl;
+	std::cout << "  --dump-bytecode, -d    Create .lbin bytecode file with hexdump." << std::endl;
 	std::cout << "  --trace, -t            Trace every executed line." << std::endl;
 	std::cout << "  --count, -c            Track instruction samples." << std::endl;
 	std::cout << "  --memory, -m           Print memory summary after execution." << std::endl;
-	std::cout << "  --vm                   Instrument VM with timing and diagnostics." << std::endl;
+	std::cout << "  --vm, -v               Instrument VM with timing and diagnostics." << std::endl;
+	std::cout << "  --version              Show version information." << std::endl;
 	std::cout << "  --help, -h             Show this help message." << std::endl;
+}
+
+void printVersion()
+{
+	std::cout << kProgramTitle << " " << OFFENSIVE_LUAJIT_VERSION << std::endl;
 }
 
 std::optional<DebugConfig> parseArguments(int argc, char* argv[])
@@ -1605,13 +1613,19 @@ std::optional<DebugConfig> parseArguments(int argc, char* argv[])
 			return std::nullopt;
 		}
 
+		if (arg == "--version")
+		{
+			printVersion();
+			return std::nullopt;
+		}
+
 		if (arg == "--interactive" || arg == "-i")
 		{
 			config.interactive = true;
 			continue;
 		}
 
-		if (arg == "--dump-bytecode")
+		if (arg == "--dump-bytecode" || arg == "-d")
 		{
 			config.dumpBytecode = true;
 			continue;
@@ -1635,7 +1649,7 @@ std::optional<DebugConfig> parseArguments(int argc, char* argv[])
 			continue;
 		}
 
-		if (arg == "--vm")
+		if (arg == "--vm" || arg == "-v")
 		{
 			config.instrumentVM = true;
 			continue;
