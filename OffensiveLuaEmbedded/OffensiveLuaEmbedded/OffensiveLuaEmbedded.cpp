@@ -1263,7 +1263,29 @@ private:
 
 	bool loadScript()
 	{
-		const int status = luaL_loadfile(luaState.get(), config.scriptPath.c_str());
+		// Check if it's a precompiled bytecode file (.lbin)
+		std::filesystem::path scriptPath(config.scriptPath);
+		bool isBytecode = (scriptPath.extension() == ".lbin");
+
+		int status = LUA_ERRFILE;
+		
+		if (isBytecode)
+		{
+			// Load precompiled bytecode directly
+			status = luaL_loadfile(luaState.get(), config.scriptPath.c_str());
+		}
+		else
+		{
+			// Load and compile .lua file
+			status = luaL_loadfile(luaState.get(), config.scriptPath.c_str());
+			
+			// Save bytecode to .lbin file
+			if (status == LUA_OK)
+			{
+				saveBytecode(scriptPath);
+			}
+		}
+
 		if (status != LUA_OK)
 		{
 			const char* message = lua_tostring(luaState.get(), -1);
@@ -1273,6 +1295,43 @@ private:
 
 		debugger.prepareChunkMetadata(-1, config.scriptPath);
 		return true;
+	}
+
+	void saveBytecode(const std::filesystem::path& luaPath)
+	{
+		// Generate .lbin path
+		auto lbinPath = luaPath;
+		lbinPath.replace_extension(".lbin");
+
+		// Dump bytecode using lua_dump
+		FILE* outFile = nullptr;
+#ifdef _MSC_VER
+		if (fopen_s(&outFile, lbinPath.string().c_str(), "wb") != 0 || !outFile)
+#else
+		outFile = fopen(lbinPath.string().c_str(), "wb");
+		if (!outFile)
+#endif
+		{
+			std::cerr << "[warning] Could not create bytecode file: " << lbinPath.string() << std::endl;
+			return;
+		}
+
+		// lua_dump callback to write to file
+		auto writer = [](lua_State* L, const void* p, size_t sz, void* ud) -> int {
+			FILE* f = static_cast<FILE*>(ud);
+			return (fwrite(p, 1, sz, f) == sz) ? 0 : 1;
+		};
+
+		if (lua_dump(luaState.get(), writer, outFile) != 0)
+		{
+			std::cerr << "[warning] Failed to dump bytecode to: " << lbinPath.string() << std::endl;
+		}
+		else
+		{
+			std::cout << "[bytecode] Saved to " << lbinPath.string() << std::endl;
+		}
+
+		fclose(outFile);
 	}
 
 	void setupArguments()
