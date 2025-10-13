@@ -1,6 +1,7 @@
 // OffensiveLuaEmbedded.cpp : Advanced LuaJIT script debugger utility.
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -17,6 +18,13 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
 
 extern "C" {
 #include <lua.h>
@@ -62,12 +70,138 @@ static int gDebuggerRegistryKey = 0;
 struct DebugConfig
 {
 	bool interactive = false;
-	bool dumpBytecode = true;
+	bool dumpBytecode = false;
 	bool traceLines = false;
-	bool countInstructions = true;
-	bool printMemorySummary = true;
+	bool countInstructions = false;
+	bool printMemorySummary = false;
+	bool instrumentVM = false;
 	std::string scriptPath;
 	std::vector<std::string> scriptArgs;
+};
+
+struct VMInstrumentation
+{
+	std::chrono::high_resolution_clock::time_point vmCreateTime;
+	std::chrono::high_resolution_clock::time_point vmDestroyTime;
+	std::chrono::high_resolution_clock::time_point executionStartTime;
+	std::chrono::high_resolution_clock::time_point executionEndTime;
+	size_t initialMemoryKB = 0;
+	size_t peakMemoryKB = 0;
+	size_t finalMemoryKB = 0;
+	uint64_t cpuCyclesStart = 0;
+	uint64_t cpuCyclesEnd = 0;
+	bool enabled = false;
+
+	void recordVMCreate()
+	{
+		if (!enabled) return;
+		vmCreateTime = std::chrono::high_resolution_clock::now();
+		initialMemoryKB = getCurrentMemoryKB();
+		cpuCyclesStart = getCPUCycles();
+		std::cout << "[VM] Lua VM created at " << getTimestamp() << std::endl;
+		std::cout << "[VM] Initial process memory: " << initialMemoryKB << " KB" << std::endl;
+	}
+
+	void recordExecutionStart()
+	{
+		if (!enabled) return;
+		executionStartTime = std::chrono::high_resolution_clock::now();
+		std::cout << "[VM] Script execution started at " << getTimestamp() << std::endl;
+	}
+
+	void recordExecutionEnd()
+	{
+		if (!enabled) return;
+		executionEndTime = std::chrono::high_resolution_clock::now();
+		cpuCyclesEnd = getCPUCycles();
+		finalMemoryKB = getCurrentMemoryKB();
+		if (finalMemoryKB > peakMemoryKB) peakMemoryKB = finalMemoryKB;
+		std::cout << "[VM] Script execution ended at " << getTimestamp() << std::endl;
+	}
+
+	void recordVMDestroy()
+	{
+		if (!enabled) return;
+		vmDestroyTime = std::chrono::high_resolution_clock::now();
+		std::cout << "[VM] Lua VM destroyed at " << getTimestamp() << std::endl;
+		printSummary();
+	}
+
+	void updatePeakMemory()
+	{
+		if (!enabled) return;
+		size_t current = getCurrentMemoryKB();
+		if (current > peakMemoryKB) peakMemoryKB = current;
+	}
+
+	void printSummary()
+	{
+		if (!enabled) return;
+
+		auto vmLifetime = std::chrono::duration_cast<std::chrono::milliseconds>(
+			vmDestroyTime - vmCreateTime).count();
+		auto executionTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+			executionEndTime - executionStartTime).count();
+
+		std::cout << "\n[VM Instrumentation Summary]" << std::endl;
+		std::cout << "  VM Lifetime:        " << vmLifetime << " ms" << std::endl;
+		std::cout << "  Execution Time:     " << executionTime << " ms" << std::endl;
+		std::cout << "  Initial Memory:     " << initialMemoryKB << " KB" << std::endl;
+		std::cout << "  Peak Memory:        " << peakMemoryKB << " KB" << std::endl;
+		std::cout << "  Final Memory:       " << finalMemoryKB << " KB" << std::endl;
+		std::cout << "  Memory Delta:       " << static_cast<int64_t>(finalMemoryKB - initialMemoryKB) << " KB" << std::endl;
+		
+		if (cpuCyclesEnd > cpuCyclesStart)
+		{
+			std::cout << "  CPU Cycles:         " << (cpuCyclesEnd - cpuCyclesStart) << std::endl;
+		}
+	}
+
+private:
+	static std::string getTimestamp()
+	{
+		auto now = std::chrono::system_clock::now();
+		auto time = std::chrono::system_clock::to_time_t(now);
+		auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+			now.time_since_epoch()) % 1000;
+		
+		std::tm timeinfo;
+#ifdef _WIN32
+		localtime_s(&timeinfo, &time);
+#else
+		localtime_r(&time, &timeinfo);
+#endif
+		
+		std::ostringstream oss;
+		oss << std::put_time(&timeinfo, "%H:%M:%S");
+		oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
+		return oss.str();
+	}
+
+	static size_t getCurrentMemoryKB()
+	{
+#ifdef _WIN32
+		PROCESS_MEMORY_COUNTERS pmc;
+		if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+		{
+			return pmc.WorkingSetSize / 1024;
+		}
+#endif
+		return 0;
+	}
+
+	static uint64_t getCPUCycles()
+	{
+#ifdef _MSC_VER
+		return __rdtsc();
+#elif defined(__GNUC__) || defined(__clang__)
+		uint32_t lo, hi;
+		__asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
+		return ((uint64_t)hi << 32) | lo;
+#else
+		return 0;
+#endif
+	}
 };
 
 class ScopedStackGuard
@@ -245,10 +379,11 @@ class LuaDebugger
 public:
 	LuaDebugger() = default;
 
-	void initialize(lua_State* state, const DebugConfig& cfg)
+	void initialize(lua_State* state, const DebugConfig& cfg, VMInstrumentation* vmInstr = nullptr)
 	{
 		L = state;
 		config = cfg;
+		vmInst = vmInstr;
 		registerSelf();
 		if (config.interactive)
 		{
@@ -424,6 +559,7 @@ private:
 
 	lua_State* L = nullptr;
 	DebugConfig config{};
+	VMInstrumentation* vmInst = nullptr;
 	bool hooksActive = false;
 	int hookMask = 0;
 	int hookCount = 0;
@@ -489,6 +625,10 @@ private:
 			break;
 		case LUA_HOOKCOUNT:
 			totalInstructionCount += static_cast<uint64_t>(kInstructionSampleInterval);
+			if (vmInst)
+			{
+				vmInst->updatePeakMemory();
+			}
 			break;
 		case LUA_HOOKLINE:
 			handleLineEvent(state, ar);
@@ -1214,6 +1354,10 @@ public:
 	int run(const DebugConfig& cfg)
 	{
 		config = cfg;
+		vmInstrumentation.enabled = config.instrumentVM;
+		
+		vmInstrumentation.recordVMCreate();
+		
 		luaState.reset(luaL_newstate());
 		if (!luaState)
 		{
@@ -1223,24 +1367,25 @@ public:
 
 		luaL_openlibs(luaState.get());
 
-		debugger.initialize(luaState.get(), config);
+		debugger.initialize(luaState.get(), config, &vmInstrumentation);
 
 		if (!loadScript())
 		{
+			vmInstrumentation.recordVMDestroy();
 			return EXIT_FAILURE;
-		}
-
-		if (config.dumpBytecode)
-		{
-			debugger.dumpBytecodeFromStackIndex(-1, config.scriptPath);
 		}
 
 		setupArguments();
 
 		debugger.beforeExecution();
 
+		vmInstrumentation.recordExecutionStart();
 		const int status = lua_pcall(luaState.get(), 0, LUA_MULTRET, 0);
+		vmInstrumentation.recordExecutionEnd();
+		
 		debugger.afterExecution(status);
+
+		vmInstrumentation.recordVMDestroy();
 
 		return status == LUA_OK ? EXIT_SUCCESS : EXIT_FAILURE;
 	}
@@ -1260,6 +1405,46 @@ private:
 	DebugConfig config{};
 	std::unique_ptr<lua_State, LuaStateDeleter> luaState;
 	LuaDebugger debugger;
+	VMInstrumentation vmInstrumentation;
+
+	void printHexdump(const std::vector<unsigned char>& data, const std::string& label)
+	{
+		std::cout << "[" << label << "] Size: " << data.size() << " bytes" << std::endl;
+		std::cout << "[" << label << "] Hexdump:" << std::endl;
+		
+		constexpr size_t bytesPerLine = 16;
+		for (size_t offset = 0; offset < data.size(); offset += bytesPerLine)
+		{
+			// Print offset
+			std::cout << "  " << std::hex << std::setw(8) << std::setfill('0') << offset << "  ";
+			
+			// Print hex bytes
+			for (size_t i = 0; i < bytesPerLine; ++i)
+			{
+				if (offset + i < data.size())
+				{
+					std::cout << std::hex << std::setw(2) << std::setfill('0') 
+							  << static_cast<int>(data[offset + i]) << " ";
+				}
+				else
+				{
+					std::cout << "   ";
+				}
+				
+				if (i == 7) std::cout << " ";
+			}
+			
+			// Print ASCII representation
+			std::cout << " |";
+			for (size_t i = 0; i < bytesPerLine && offset + i < data.size(); ++i)
+			{
+				unsigned char c = data[offset + i];
+				std::cout << (std::isprint(c) ? static_cast<char>(c) : '.');
+			}
+			std::cout << "|" << std::endl;
+		}
+		std::cout << std::dec;
+	}
 
 	bool loadScript()
 	{
@@ -1271,6 +1456,18 @@ private:
 		
 		if (isBytecode)
 		{
+			// Read and display the bytecode file
+			std::ifstream inFile(config.scriptPath, std::ios::binary);
+			if (inFile)
+			{
+				std::vector<unsigned char> bytecodeData((std::istreambuf_iterator<char>(inFile)), 
+														std::istreambuf_iterator<char>());
+				inFile.close();
+				
+				std::cout << "[bytecode] Loading from " << config.scriptPath << std::endl;
+				printHexdump(bytecodeData, "bytecode");
+			}
+			
 			// Load precompiled bytecode directly
 			status = luaL_loadfile(luaState.get(), config.scriptPath.c_str());
 		}
@@ -1279,8 +1476,8 @@ private:
 			// Load and compile .lua file
 			status = luaL_loadfile(luaState.get(), config.scriptPath.c_str());
 			
-			// Save bytecode to .lbin file
-			if (status == LUA_OK)
+			// Save bytecode to .lbin file if requested
+			if (status == LUA_OK && config.dumpBytecode)
 			{
 				saveBytecode(scriptPath);
 			}
@@ -1303,7 +1500,28 @@ private:
 		auto lbinPath = luaPath;
 		lbinPath.replace_extension(".lbin");
 
-		// Dump bytecode using lua_dump
+		// First, collect bytecode into a vector for hexdump
+		std::vector<unsigned char> bytecodeData;
+		
+		// lua_dump callback to collect bytecode
+		auto collector = [](lua_State* L, const void* p, size_t sz, void* ud) -> int {
+			std::vector<unsigned char>* vec = static_cast<std::vector<unsigned char>*>(ud);
+			const unsigned char* bytes = static_cast<const unsigned char*>(p);
+			vec->insert(vec->end(), bytes, bytes + sz);
+			return 0;
+		};
+
+		if (lua_dump(luaState.get(), collector, &bytecodeData) != 0)
+		{
+			std::cerr << "[warning] Failed to dump bytecode" << std::endl;
+			return;
+		}
+
+		// Display hexdump
+		std::cout << "[bytecode] Creating " << lbinPath.string() << std::endl;
+		printHexdump(bytecodeData, "bytecode");
+
+		// Now write to file
 		FILE* outFile = nullptr;
 #ifdef _MSC_VER
 		if (fopen_s(&outFile, lbinPath.string().c_str(), "wb") != 0 || !outFile)
@@ -1316,19 +1534,13 @@ private:
 			return;
 		}
 
-		// lua_dump callback to write to file
-		auto writer = [](lua_State* L, const void* p, size_t sz, void* ud) -> int {
-			FILE* f = static_cast<FILE*>(ud);
-			return (fwrite(p, 1, sz, f) == sz) ? 0 : 1;
-		};
-
-		if (lua_dump(luaState.get(), writer, outFile) != 0)
+		if (fwrite(bytecodeData.data(), 1, bytecodeData.size(), outFile) != bytecodeData.size())
 		{
-			std::cerr << "[warning] Failed to dump bytecode to: " << lbinPath.string() << std::endl;
+			std::cerr << "[warning] Failed to write bytecode to file" << std::endl;
 		}
 		else
 		{
-			std::cout << "[bytecode] Saved to " << lbinPath.string() << std::endl;
+			std::cout << "[bytecode] Saved successfully" << std::endl;
 		}
 
 		fclose(outFile);
@@ -1366,13 +1578,11 @@ void printUsage()
 	std::cout << "Usage: luadebug [options] <script.lua> [args...]" << std::endl;
 	std::cout << "Options:" << std::endl;
 	std::cout << "  --interactive, -i      Enable interactive debugging mode." << std::endl;
-	std::cout << "  --dump-bytecode, -b    Dump chunk bytecode (default)." << std::endl;
-	std::cout << "  --no-bytecode          Disable bytecode dump." << std::endl;
-	std::cout << "  --trace-lines, -t      Log every executed line." << std::endl;
-	std::cout << "  --count, -c            Track instruction samples (default)." << std::endl;
-	std::cout << "  --no-count             Disable instruction sampling." << std::endl;
-	std::cout << "  --memory, -m           Print memory summary after execution (default)." << std::endl;
-	std::cout << "  --no-memory            Skip memory summary." << std::endl;
+	std::cout << "  --dump-bytecode        Create .lbin bytecode file with hexdump." << std::endl;
+	std::cout << "  --trace, -t            Trace every executed line." << std::endl;
+	std::cout << "  --count, -c            Track instruction samples." << std::endl;
+	std::cout << "  --memory, -m           Print memory summary after execution." << std::endl;
+	std::cout << "  --vm                   Instrument VM with timing and diagnostics." << std::endl;
 	std::cout << "  --help, -h             Show this help message." << std::endl;
 }
 
@@ -1401,19 +1611,13 @@ std::optional<DebugConfig> parseArguments(int argc, char* argv[])
 			continue;
 		}
 
-		if (arg == "--dump-bytecode" || arg == "-b")
+		if (arg == "--dump-bytecode")
 		{
 			config.dumpBytecode = true;
 			continue;
 		}
 
-		if (arg == "--no-bytecode")
-		{
-			config.dumpBytecode = false;
-			continue;
-		}
-
-		if (arg == "--trace-lines" || arg == "-t")
+		if (arg == "--trace" || arg == "-t")
 		{
 			config.traceLines = true;
 			continue;
@@ -1425,21 +1629,15 @@ std::optional<DebugConfig> parseArguments(int argc, char* argv[])
 			continue;
 		}
 
-		if (arg == "--no-count")
-		{
-			config.countInstructions = false;
-			continue;
-		}
-
 		if (arg == "--memory" || arg == "-m")
 		{
 			config.printMemorySummary = true;
 			continue;
 		}
 
-		if (arg == "--no-memory")
+		if (arg == "--vm")
 		{
-			config.printMemorySummary = false;
+			config.instrumentVM = true;
 			continue;
 		}
 

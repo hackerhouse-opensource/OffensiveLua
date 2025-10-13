@@ -20,6 +20,7 @@ typedef int64_t LONGLONG;
 typedef uint64_t ULONGLONG;
 typedef char* LPSTR;
 typedef DWORD* PDWORD;
+typedef SIZE_T ULONG_PTR;
 
 /* Struct for native 32-bit processes */
 typedef struct {
@@ -74,11 +75,50 @@ void RtlSetLastWin32ErrorAndNtStatusFromNtStatus(NTSTATUS Status);
 BOOL OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess, HANDLE* TokenHandle);
 BOOL LookupPrivilegeValueA(const char* lpSystemName, const char* lpName, LUID* lpLuid);
 BOOL AdjustTokenPrivileges(HANDLE TokenHandle, BOOL DisableAllPrivileges, TOKEN_PRIVILEGES* NewState, DWORD BufferLength, TOKEN_PRIVILEGES* PreviousState, DWORD* ReturnLength);
+DWORD GetCurrentThreadId(void);
+BOOL EnumProcessModules(HANDLE hProcess, HANDLE* lphModule, DWORD cb, DWORD* lpcbNeeded);
+DWORD GetModuleBaseNameA(HANDLE hProcess, HANDLE hModule, LPSTR lpBaseName, DWORD nSize);
+BOOL GetModuleInformation(HANDLE hProcess, HANDLE hModule, void* lpmodinfo, DWORD cb);
+typedef struct {
+    PVOID lpBaseOfDll;
+    DWORD SizeOfImage;
+    PVOID EntryPoint;
+} MODULEINFO, *LPMODULEINFO;
+typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(void* ExceptionInfo);
+PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler);
+typedef struct {
+    DWORD ExceptionCode;
+    DWORD ExceptionFlags;
+    void* ExceptionRecord;
+    PVOID ExceptionAddress;
+    DWORD NumberParameters;
+    ULONG_PTR ExceptionInformation[15];
+} EXCEPTION_RECORD;
+typedef struct {
+    EXCEPTION_RECORD ExceptionRecord;
+    void* ContextRecord;
+} EXCEPTION_POINTERS;
 ]]
 
 local kernel32 = ffi.load("kernel32")
 local ntdll = ffi.load("ntdll")
 local advapi32 = ffi.load("advapi32")
+local psapi = ffi.load("psapi")
+
+-- Global flag for exception handling
+local exceptionHandled = false
+
+-- Exception handler to catch access violations
+local function exceptionHandler(exceptionPointers)
+    local exceptionRecord = exceptionPointers.ExceptionRecord
+    if exceptionRecord.ExceptionCode == STATUS_ACCESS_VIOLATION then
+        if not exceptionHandled then
+            exceptionHandled = true
+            return 0  -- EXCEPTION_CONTINUE_EXECUTION
+        end
+    end
+    return 1  -- EXCEPTION_CONTINUE_SEARCH
+end
 
 -- === Configuration ===
 local SEARCH_STRING = "password"       -- change as needed
@@ -175,7 +215,14 @@ local function toUnicodeLE(str)
 end
 
 local function isReadableProtection(protect)
-    return bit.band(protect, PAGE_READWRITE) ~= 0
+    -- Exclude PAGE_GUARD and PAGE_NOACCESS
+    if bit.band(protect, PAGE_GUARD) ~= 0 or protect == PAGE_NOACCESS then
+        return false
+    end
+    -- Check for any readable protection flags
+    local readable = bit.bor(PAGE_READONLY, PAGE_READWRITE, PAGE_EXECUTE_READ, 
+                             PAGE_EXECUTE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE_WRITECOPY)
+    return bit.band(protect, readable) ~= 0
 end
 
 -- Helper function to read memory safely
@@ -183,7 +230,7 @@ local function safeNtRead(processHandle, address, size)
     local buffer = ffi.new("uint8_t[?]", size)
     local bytesRead = ffi.new("SIZE_T[1]")
     
-    local status = ntdll.NtReadVirtualMemory(processHandle, address, buffer, size, bytesRead)
+    local status = ntdll.NtReadVirtualMemory(processHandle, ffi.cast("PVOID", address), buffer, size, bytesRead)
 
     if status ~= STATUS_SUCCESS and status ~= STATUS_PARTIAL_COPY then
         if status ~= STATUS_ACCESS_VIOLATION then
@@ -352,10 +399,42 @@ local function scanRegion(processHandle, logFile, baseAddr, regionSize, searcher
     end
 end
 
+local function logLoadedModules(processHandle, logFile)
+    writeLog(logFile, "\n=== LOADED MODULES ===\n")
+    local modules = ffi.new("HANDLE[1024]")
+    local needed = ffi.new("DWORD[1]")
+    local success = psapi.EnumProcessModules(processHandle, modules, ffi.sizeof(modules), needed)
+    if success == 0 then
+        writeLog(logFile, "Failed to enumerate modules\n")
+        return
+    end
+    local moduleCount = needed[0] / ffi.sizeof("HANDLE")
+    for i = 0, moduleCount - 1 do
+        local modInfo = ffi.new("MODULEINFO")
+        success = psapi.GetModuleInformation(processHandle, modules[i], modInfo, ffi.sizeof(modInfo))
+        if success ~= 0 then
+            local baseName = ffi.new("char[256]")
+            psapi.GetModuleBaseNameA(processHandle, modules[i], baseName, 256)
+            local baseAddr = tonumber(ffi.cast("intptr_t", modInfo.lpBaseOfDll))
+            local size = modInfo.SizeOfImage
+            writeLog(logFile, string.format("Module: %s - 0x%08X - 0x%08X (%d KB)\n", 
+                ffi.string(baseName), baseAddr, baseAddr + size, size / 1024))
+        end
+    end
+end
+
 -- Main execution
 function main()
     local logFile = assert(io.open(LOG_PATH, "a"))
     writeLog(logFile, "\n--------------------------------------------------\n")
+
+    -- Install exception handler for access violations
+    local handler = kernel32.AddVectoredExceptionHandler(1, exceptionHandler)  -- 1 = first handler
+    if handler == nil then
+        writeLog(logFile, "Warning: Failed to install exception handler\n")
+    else
+        writeLog(logFile, "Exception handler installed\n")
+    end
 
     local function getProcessName(pHandle)
         local size = ffi.new("DWORD[1]", 260)
@@ -425,6 +504,9 @@ function main()
     
     writeLog(logFile, string.format("Process Name: %s\n", getProcessName(processHandle)))
     writeLog(logFile, string.format("Opened handle to PID %d: 0x%X\n", processId, tonumber(ffi.cast("intptr_t", processHandle))))
+    writeLog(logFile, string.format("Current Thread ID: %d\n", kernel32.GetCurrentThreadId()))
+
+    logLoadedModules(processHandle, logFile)
 
     local address = 0x10000 -- Start scan above first 64K
     local regions, readableRegions = 0, 0
@@ -492,6 +574,8 @@ function main()
             address = baseAddr + 0x1000
         end
     end
+
+    logLoadedModules(processHandle, logFile)
 
     kernel32.CloseHandle(processHandle)
 
