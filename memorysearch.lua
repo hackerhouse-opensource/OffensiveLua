@@ -1,13 +1,22 @@
--- memorysearch_rtl.lua
+-- memorysearch.lua
 -- Memory searcher for ASCII and UTF-16LE strings
--- Uses ReadProcessMemory (has internal SEH) instead of NtReadVirtualMemory
 -- Safe for execution in DLL worker threads with LuaJIT
 
 local jit = require("jit")
-jit.off(true, true)  -- Disable JIT to prevent FFI callback trampoline issues
+-- disable JIT optimizations for FFI callbacks and error handling
+jit.off(true, true)
 
 local ffi = require("ffi")
 local bit = require("bit")
+
+-- === Configuration ===
+local SEARCH_STRING = "password"
+local CHUNK_SIZE = 0x1000
+local MAX_STRING_CONCAT_SIZE = 0x10000
+local ADDRESS_LIMIT = 0x7FFFFFFFFFFFFFFF
+local CONTEXT_BEFORE = 96
+local CONTEXT_AFTER = 64
+local MAX_REGIONS_TO_SCAN = 10000
 
 ffi.cdef[[
 typedef unsigned char BYTE;
@@ -75,7 +84,6 @@ BOOL CloseHandle(HANDLE hObject);
 BOOL IsWow64Process(HANDLE hProcess, BOOL* Wow64Process);
 HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
 BOOL ReadProcessMemory(HANDLE hProcess, PVOID lpBaseAddress, PVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead);
-BOOL ReadProcessMemory(HANDLE hProcess, PVOID lpBaseAddress, PVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead);
 BOOL OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess, HANDLE* TokenHandle);
 BOOL LookupPrivilegeValueA(const char* lpSystemName, const char* lpName, LUID* lpLuid);
 BOOL AdjustTokenPrivileges(HANDLE TokenHandle, BOOL DisableAllPrivileges, TOKEN_PRIVILEGES* NewState, DWORD BufferLength, TOKEN_PRIVILEGES* PreviousState, DWORD* ReturnLength);
@@ -88,25 +96,13 @@ typedef struct {
     DWORD SizeOfImage;
     PVOID EntryPoint;
 } MODULEINFO, *LPMODULEINFO;
+
+DWORD GetEnvironmentVariableA(const char* lpName, char* lpBuffer, DWORD nSize);
 ]]
 
 local kernel32 = ffi.load("kernel32")
 local advapi32 = ffi.load("advapi32")
 local psapi = ffi.load("psapi")
-
--- === Exception handling infrastructure ===
-local exceptionOccurred = false
-
--- === Configuration ===
-local SEARCH_STRING = "password"       -- change as needed
-local LOG_PATH = "c:/temp/memoryexploit.log"
-
-local CHUNK_SIZE = 0x1000               -- 4 KB read window per chunk
-local MAX_STRING_CONCAT_SIZE = 0x10000  -- 64 KB max to prevent stack exhaustion
-local ADDRESS_LIMIT = 0x7FFFFFFFFFFFFFFF
-local CONTEXT_BEFORE = 96               -- bytes (or UTF-16 pairs) before match
-local CONTEXT_AFTER = 64                -- bytes (or UTF-16 pairs) after match
-local MAX_REGIONS_TO_SCAN = 10000       -- Safety limit to prevent infinite loops
 
 -- === Constants ===
 local PROCESS_QUERY_INFORMATION = 0x0400
@@ -174,6 +170,23 @@ local function enableDebugPrivilege()
     end
     
     return true
+end
+
+local function getTempPath()
+    local buffer = ffi.new("char[?]", 260)
+    local size = kernel32.GetEnvironmentVariableA("TEMP", buffer, 260)
+    if size > 0 and size < 260 then
+        return ffi.string(buffer)
+    end
+    return "c:/temp"
+end
+
+local function generateLogPath(processName, pid, tid)
+    local tempPath = getTempPath()
+    local baseName = processName:match("([^/\\]+)$") or "unknown"
+    baseName = baseName:gsub("%.", "_")
+    local timestamp = os.date("%Y%m%d_%H%M%S")
+    return string.format("%s/%s_PID%d_TID%d_%s.log", tempPath, baseName, pid, tid, timestamp)
 end
 
 local function writeLog(logFile, message)
@@ -547,10 +560,15 @@ local function logLoadedModules(processHandle, logFile)
 end
 
 function main()
-    local logFile = assert(io.open(LOG_PATH, "a"))
-    writeLog(logFile, "\n--------------------------------------------------\n")
-    currentLogFile = logFile
-
+    local pid = kernel32.GetCurrentProcessId()
+    local tid = kernel32.GetCurrentThreadId()
+    local processHandle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION + PROCESS_VM_READ, false, pid)
+    
+    if processHandle == nil or tonumber(ffi.cast("intptr_t", processHandle)) == 0 then
+        print("Scan failed: Could not open process handle.")
+        return
+    end
+    
     local function getProcessName(pHandle)
         local size = ffi.new("DWORD[1]", 260)
         local buffer = ffi.new("char[?]", size[0])
@@ -558,10 +576,15 @@ function main()
         if success ~= 0 then
             return ffi.string(buffer)
         end
-        return "N/A"
+        return "unknown"
     end
+    
+    local processName = getProcessName(processHandle)
+    local logPath = generateLogPath(processName, pid, tid)
+    local logFile = assert(io.open(logPath, "w"))
+    writeLog(logFile, "\n--------------------------------------------------\n")
+    currentLogFile = logFile
 
-    -- Initial log entries
     writeLog(logFile, "Memory search log\n")
     writeLog(logFile, string.format("Scan start: %s\n", os.date("%Y-%m-%d %H:%M:%S")))
 
@@ -607,19 +630,9 @@ function main()
         }
     }
     
-    local processId = kernel32.GetCurrentProcessId()
-    local processHandle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION + PROCESS_VM_READ, false, processId)
-
-    if processHandle == nil or tonumber(ffi.cast("intptr_t", processHandle)) == 0 then
-        writeLog(logFile, string.format("\n[ERROR] OpenProcess failed (Win32=%d)\n", kernel32.GetLastError()))
-        logFile:close()
-        print("Scan failed: Could not open process handle.")
-        return
-    end
-    
-    writeLog(logFile, string.format("Process Name: %s\n", getProcessName(processHandle)))
-    writeLog(logFile, string.format("Opened handle to PID %d: 0x%X\n", processId, tonumber(ffi.cast("intptr_t", processHandle))))
-    writeLog(logFile, string.format("Current Thread ID: %d\n", kernel32.GetCurrentThreadId()))
+    writeLog(logFile, string.format("Process Name: %s\n", processName))
+    writeLog(logFile, string.format("Opened handle to PID %d: 0x%X\n", pid, tonumber(ffi.cast("intptr_t", processHandle))))
+    writeLog(logFile, string.format("Current Thread ID: %d\n", tid))
 
     logLoadedModules(processHandle, logFile)
 
@@ -732,18 +745,12 @@ function main()
 
     logFile:close()
     currentLogFile = nil
-    print(string.format("Scan complete. %d regions inspected, %d readable, results logged to %s", regions, readableRegions, LOG_PATH))
+    print(string.format("Scan complete. %d regions inspected, %d readable, results logged to %s", regions, readableRegions, logPath))
 end
 
--- Top-level execution with comprehensive error handling
 local ok, err = pcall(main)
 if not ok then
-    local fallback = io.open(LOG_PATH, "a")
-    if fallback then
-        fallback:write(string.format("\n[FATAL ERROR] Scanner crashed: %s\n", tostring(err)))
-        fallback:write(string.format("Stack trace: %s\n", debug.traceback()))
-        fallback:close()
-    end
     print(string.format("FATAL: Scanner failed - %s", tostring(err)))
+    print(debug.traceback())
     os.exit(1)
 end
