@@ -2,6 +2,7 @@
 -- Windows webcam video capture using DirectShow COM interfaces
 -- Captures 2-minute video from all detected video capture devices
 -- Safe for execution in DLL worker threads with LuaJIT
+-- Logs to %TEMP%\COMPUTERNAME_WEBCAM_VIDEO_YYYYMMDD_HHMMSS.log
 
 local jit = require("jit")
 jit.off(true, true)
@@ -11,6 +12,9 @@ local bit = require("bit")
 
 -- === Configuration ===
 local VIDEO_DURATION_SEC = 120  -- 2 minutes
+
+-- Global log file handle
+local LOG_HANDLE = nil
 
 ffi.cdef[[
 // Base Windows types
@@ -327,8 +331,74 @@ local function generateFilePath(deviceName, fileType, extension)
     return string.format("%s\\%s_%s_%s_%s.%s", tempPath, computerName, safeName, fileType, timestamp, extension)
 end
 
+local function initializeLogFile()
+    local tempPath = getTempPath()
+    local computerName = getComputerName()
+    local timestamp = os.date("%Y%m%d_%H%M%S")
+    local logPath = string.format("%s\\%s_WEBCAM_VIDEO_%s.log", tempPath, computerName, timestamp)
+    
+    LOG_HANDLE = kernel32.CreateFileA(
+        logPath,
+        GENERIC_WRITE,
+        0,
+        nil,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nil
+    )
+    
+    if LOG_HANDLE == INVALID_HANDLE_VALUE or LOG_HANDLE == nil then
+        -- Can't log if we can't open log file, just continue
+        LOG_HANDLE = nil
+        return nil
+    end
+    
+    return logPath
+end
+
+local function log(message)
+    -- Wrap everything in pcall to prevent crashes from logging
+    pcall(function()
+        -- Handle empty messages
+        if not message then
+            message = ""
+        end
+        
+        -- Print to console (if available)
+        if message == "" then
+            print("")
+        else
+            print(message)
+        end
+        
+        -- Write to log file
+        if LOG_HANDLE ~= nil and LOG_HANDLE ~= INVALID_HANDLE_VALUE then
+            local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+            local logLine
+            if message == "" then
+                logLine = string.format("[%s]\n", timestamp)
+            else
+                logLine = string.format("[%s] %s\n", timestamp, message)
+            end
+            local written = ffi.new("DWORD[1]")
+            local result = kernel32.WriteFile(LOG_HANDLE, logLine, #logLine, written, nil)
+            if result == 0 then
+                -- Log file write failed - invalidate handle to prevent future crashes
+                LOG_HANDLE = nil
+            end
+        end
+    end)
+end
+
+local function closeLogFile()
+    if LOG_HANDLE ~= nil then
+        kernel32.CloseHandle(LOG_HANDLE)
+        LOG_HANDLE = nil
+    end
+end
+
 local function enumerateVideoDevices()
-    print("[*] Enumerating video capture devices using DirectShow...")
+    log("[*] Enumerating video capture devices using DirectShow...")
     
     local devices = {}
     local pDevEnum = ffi.new("ICreateDevEnum*[1]")
@@ -342,7 +412,7 @@ local function enumerateVideoDevices()
     )
     
     if FAILED(hr) then
-        print(string.format("[!] Failed to create device enumerator: 0x%08X", tonumber(ffi.cast("long", hr))))
+        log(string.format("[!] Failed to create device enumerator: 0x%08X", tonumber(ffi.cast("long", hr))))
         return devices
     end
     
@@ -374,7 +444,7 @@ local function enumerateVideoDevices()
                             name = deviceName,
                             moniker = pMoniker[0]
                         })
-                        print(string.format("  [%d] %s", deviceIndex, deviceName))
+                        log(string.format("  [%d] %s", deviceIndex, deviceName))
                         deviceIndex = deviceIndex + 1
                     end
                     
@@ -394,7 +464,7 @@ local function enumerateVideoDevices()
 end
 
 local function captureVideoFromDevice(device, durationSec)
-    print(string.format("[*] Capturing %d-second video from device: %s", durationSec, device.name))
+    log(string.format("[*] Capturing %d-second video from device: %s", durationSec, device.name))
     
     local pGraph = ffi.new("IGraphBuilder*[1]")
     local pCapture = ffi.new("ICaptureGraphBuilder2*[1]")
@@ -409,47 +479,47 @@ local function captureVideoFromDevice(device, durationSec)
     repeat
         -- Generate output path
         outputPath = generateFilePath(device.name, "VIDEO", "avi")
-        print(string.format("[*] Output file: %s", outputPath))
+        log(string.format("[*] Output file: %s", outputPath))
         
         -- Create filter graph
         local hr = ole32.CoCreateInstance(CLSID_FilterGraph, nil, CLSCTX_INPROC_SERVER, IID_IGraphBuilder, ffi.cast("void**", pGraph))
         if FAILED(hr) then
-            print(string.format("[!] Failed to create filter graph: 0x%08X", tonumber(ffi.cast("long", hr))))
+            log(string.format("[!] Failed to create filter graph: 0x%08X", tonumber(ffi.cast("long", hr))))
             break
         end
-        print("[+] Created filter graph")
+        log("[+] Created filter graph")
         
         -- Create capture graph builder
         hr = ole32.CoCreateInstance(CLSID_CaptureGraphBuilder2, nil, CLSCTX_INPROC_SERVER, IID_ICaptureGraphBuilder2, ffi.cast("void**", pCapture))
         if FAILED(hr) then
-            print(string.format("[!] Failed to create capture graph builder: 0x%08X", tonumber(ffi.cast("long", hr))))
+            log(string.format("[!] Failed to create capture graph builder: 0x%08X", tonumber(ffi.cast("long", hr))))
             break
         end
-        print("[+] Created capture graph builder")
+        log("[+] Created capture graph builder")
         
         -- Attach filter graph to capture graph
         hr = pCapture[0].lpVtbl.SetFiltergraph(pCapture[0], pGraph[0])
         if FAILED(hr) then
-            print(string.format("[!] Failed to set filter graph: 0x%08X", tonumber(ffi.cast("long", hr))))
+            log(string.format("[!] Failed to set filter graph: 0x%08X", tonumber(ffi.cast("long", hr))))
             break
         end
-        print("[+] Set filter graph")
+        log("[+] Set filter graph")
         
         -- Bind moniker to source filter
         hr = device.moniker.lpVtbl.BindToObject(device.moniker, nil, nil, IID_IBaseFilter, ffi.cast("void**", pSource))
         if FAILED(hr) then
-            print(string.format("[!] Failed to bind device moniker: 0x%08X", tonumber(ffi.cast("long", hr))))
+            log(string.format("[!] Failed to bind device moniker: 0x%08X", tonumber(ffi.cast("long", hr))))
             break
         end
-        print("[+] Bound device to source filter")
+        log("[+] Bound device to source filter")
         
         -- Add source filter to graph
         hr = pGraph[0].lpVtbl.AddFilter(pGraph[0], pSource[0], wstring("Video Capture"))
         if FAILED(hr) then
-            print(string.format("[!] Failed to add source filter: 0x%08X", tonumber(ffi.cast("long", hr))))
+            log(string.format("[!] Failed to add source filter: 0x%08X", tonumber(ffi.cast("long", hr))))
             break
         end
-        print("[+] Added source filter to graph")
+        log("[+] Added source filter to graph")
         
         -- Set output filename (this creates the mux and file writer)
         hr = pCapture[0].lpVtbl.SetOutputFileName(
@@ -461,13 +531,13 @@ local function captureVideoFromDevice(device, durationSec)
         )
         
         if FAILED(hr) then
-            print(string.format("[!] Failed to set output filename: 0x%08X", tonumber(ffi.cast("long", hr))))
+            log(string.format("[!] Failed to set output filename: 0x%08X", tonumber(ffi.cast("long", hr))))
             break
         end
-        print("[+] Set output filename and created mux/sink")
+        log("[+] Set output filename and created mux/sink")
         
         -- Render the capture stream to the mux
-        print("[*] Rendering capture stream to file...")
+        log("[*] Rendering capture stream to file...")
         hr = pCapture[0].lpVtbl.RenderStream(
             pCapture[0],
             PIN_CATEGORY_CAPTURE,
@@ -478,42 +548,42 @@ local function captureVideoFromDevice(device, durationSec)
         )
         
         if FAILED(hr) then
-            print(string.format("[!] Failed to render stream: 0x%08X", tonumber(ffi.cast("long", hr))))
+            log(string.format("[!] Failed to render stream: 0x%08X", tonumber(ffi.cast("long", hr))))
             break
         end
-        print("[+] Rendered capture stream to file")
+        log("[+] Rendered capture stream to file")
         
         -- Get media control interface
         hr = pGraph[0].lpVtbl.QueryInterface(pGraph[0], IID_IMediaControl, ffi.cast("void**", pControl))
         if FAILED(hr) then
-            print(string.format("[!] Failed to get media control: 0x%08X", tonumber(ffi.cast("long", hr))))
+            log(string.format("[!] Failed to get media control: 0x%08X", tonumber(ffi.cast("long", hr))))
             break
         end
-        print("[+] Got media control interface")
+        log("[+] Got media control interface")
         
         -- Run the filter graph
-        print(string.format("[*] Starting video capture for %d seconds...", durationSec))
+        log(string.format("[*] Starting video capture for %d seconds...", durationSec))
         hr = pControl[0].lpVtbl.Run(pControl[0])
         if FAILED(hr) then
-            print(string.format("[!] Failed to run graph: 0x%08X", tonumber(ffi.cast("long", hr))))
+            log(string.format("[!] Failed to run graph: 0x%08X", tonumber(ffi.cast("long", hr))))
             break
         end
-        print("[+] Filter graph running - recording...")
+        log("[+] Filter graph running - recording...")
         
         -- Wait for the specified duration
         local remainingSeconds = durationSec
         while remainingSeconds > 0 do
             if remainingSeconds % 10 == 0 or remainingSeconds <= 5 then
-                print(string.format("    [%d seconds remaining...]", remainingSeconds))
+                log(string.format("    [%d seconds remaining...]", remainingSeconds))
             end
             kernel32.Sleep(1000)
             remainingSeconds = remainingSeconds - 1
         end
         
         -- Stop the graph
-        print("[*] Stopping capture...")
+        log("[*] Stopping capture...")
         pControl[0].lpVtbl.Stop(pControl[0])
-        print("[+] Capture stopped")
+        log("[+] Capture stopped")
         
         success = true
         
@@ -525,32 +595,32 @@ local function captureVideoFromDevice(device, durationSec)
 end
 
 function main()
-    print("=== DirectShow Webcam Video Capture Tool ===")
-    print(string.format("Computer: %s", getComputerName()))
-    print(string.format("Timestamp: %s", os.date("%Y-%m-%d %H:%M:%S")))
-    print(string.format("Video Duration: %d seconds", VIDEO_DURATION_SEC))
-    print()
+    log("=== DirectShow Webcam Video Capture ===")
+    log(string.format("Computer: %s", getComputerName()))
+    log(string.format("Timestamp: %s", os.date("%Y-%m-%d %H:%M:%S")))
+    log(string.format("Video Duration: %d seconds", VIDEO_DURATION_SEC))
+    log("")
     
     -- Initialize COM
     local hr = ole32.CoInitializeEx(nil, COINIT_MULTITHREADED)
     if FAILED(hr) and tonumber(ffi.cast("long", hr)) ~= 0x00000001 then
-        print(string.format("[!] Failed to initialize COM: 0x%08X", tonumber(ffi.cast("long", hr))))
+        log(string.format("[!] Failed to initialize COM: 0x%08X", tonumber(ffi.cast("long", hr))))
         return false
     end
-    print("[+] COM initialized")
-    print()
+    log("[+] COM initialized")
+    log()
     
     local devices = enumerateVideoDevices()
     
     if #devices == 0 then
-        print("[!] No video capture devices found")
+        log("[!] No video capture devices found")
         ole32.CoUninitialize()
         return false
     end
     
-    print()
-    print(string.format("[*] Found %d device(s), capturing video from all...", #devices))
-    print()
+    log()
+    log(string.format("[*] Found %d device(s), capturing video from all...", #devices))
+    log()
     
     local capturedFiles = {}
     
@@ -561,24 +631,29 @@ function main()
             table.insert(capturedFiles, outputPath)
         end
         
-        print()
+        log()
     end
     
-    print("=== Capture Complete ===")
-    print(string.format("[+] Successfully captured %d/%d videos", #capturedFiles, #devices))
+    log("=== Capture Complete ===")
+    log(string.format("[+] Successfully captured %d/%d videos", #capturedFiles, #devices))
     
     for _, path in ipairs(capturedFiles) do
-        print(string.format("    %s", path))
+        log(string.format("    %s", path))
     end
     
     ole32.CoUninitialize()
+    closeLogFile()
     return #capturedFiles > 0
 end
 
 -- Execute with error handling
+local logPath = initializeLogFile()
 local ok, err = pcall(main)
 if not ok then
-    print(string.format("FATAL: Capture failed - %s", tostring(err)))
-    print(debug.traceback())
+    log(string.format("FATAL: Capture failed - %s", tostring(err)))
+    log(debug.traceback())
+    closeLogFile()
     os.exit(1)
 end
+closeLogFile()
+
