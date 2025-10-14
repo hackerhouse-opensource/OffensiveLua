@@ -1,5 +1,5 @@
 // OffensiveLuaEmbedded.cpp : Advanced LuaJIT script debugger utility.
-#define OFFENSIVE_LUAJIT_VERSION "v0.01"
+#define OFFENSIVE_LUAJIT_VERSION "v0.02"
 
 #include <algorithm>
 #include <cctype>
@@ -58,6 +58,75 @@ int main(int argc, char* argv[])
 		lua_close(L);
 	}
 	return EXIT_SUCCESS;
+}
+
+CRITICAL DEBUGGING NOTE for exception 0xe24c4a02:
+=====================================================
+If you encounter crash with:
+- Exception code: 0xe24c4a02 (LuaJIT internal error)
+- Corrupted stack with all return addresses pointing to JIT heap regions
+- Second chance exception in KERNELBASE!RaiseException
+- Thread ID != main thread (e.g., thread 0x49)
+
+ROOT CAUSE: LuaJIT FFI callbacks registered as Windows exception handlers (VEH) 
+cannot safely execute when invoked from non-main threads during exception dispatch.
+
+The FFI callback trampoline fails to properly handle the exception context transition,
+resulting in JIT code corruption and stack unwinding failure.
+
+SOLUTION: Never use AddVectoredExceptionHandler with FFI callbacks in LuaJIT.
+Use pcall/xpcall protection around unsafe FFI calls instead.
+
+WinDbg commands to confirm:
+  !address <corrupted_return_addr>  ; Will show RW heap, not code
+  u <corrupted_return_addr>         ; Will show invalid/nonsense instructions
+  lm m lua*                          ; Find LuaJIT DLL base
+  ~*k                                ; Show all thread stacks (main vs worker)
+
+- The above main implementation benefits from structured exception handling (SEH)
+  to catch access violations and other exceptions during lua_pcall. Here is an example
+  of code you can run in CreateThread.
+
+#include <windows.h>
+
+extern "C" {
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+}
+
+static LONG CALLBACK LuaThreadVEH(EXCEPTION_POINTERS* ExceptionInfo)
+{
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+DWORD WINAPI LuaThread(LPVOID lpParameter)
+{
+	lua_State* L;
+	PVOID veh = NULL;
+	int error = 0;
+	static const char cScript[] = "script";
+	if (!lpParameter) {
+		return 1;
+	}
+	L = luaL_newstate();
+	if (!L) {
+		return 2;
+	}
+	luaL_openlibs(L);
+	veh = AddVectoredExceptionHandler(1, LuaThreadVEH);
+	error = luaL_loadbuffer(L, (const char*)lpParameter, strlen((const char*)lpParameter), cScript);
+	if (!error) {
+		error = lua_pcall(L, 0, 0, 0);
+	}	
+	if (error) {
+		lua_pop(L, 1);
+	}
+	if (veh) {
+		RemoveVectoredExceptionHandler(veh);
+	}
+	lua_close(L);
+	return error ? 4 : 0;
 }
 */
 

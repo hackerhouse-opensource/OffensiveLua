@@ -1,16 +1,10 @@
 -- memorysearch_rtl.lua
--- Rtl-backed memory searcher that safely scans the current process for ASCII and UTF-16LE strings.
--- Uses NtReadVirtualMemory and Rtl error translation to avoid hard faults when pages are inaccessible.
---
--- ROBUSTNESS ENHANCEMENTS:
--- - VEH (Vectored Exception Handler) for catching hard access violations
--- - pcall protection around all FFI calls and string operations
--- - Stack exhaustion prevention via string concatenation limits (MAX_STRING_CONCAT_SIZE)
--- - Infinite loop detection with region scan limits (MAX_REGIONS_TO_SCAN)
--- - Consecutive failure tracking to abort problematic regions early
--- - Protected byte-by-byte operations to prevent out-of-bounds access
--- - Progress indicators for long-running scans
--- - Comprehensive error logging with stack traces
+-- Memory searcher for ASCII and UTF-16LE strings
+-- Uses ReadProcessMemory (has internal SEH) instead of NtReadVirtualMemory
+-- Safe for execution in DLL worker threads with LuaJIT
+
+local jit = require("jit")
+jit.off(true, true)  -- Disable JIT to prevent FFI callback trampoline issues
 
 local ffi = require("ffi")
 local bit = require("bit")
@@ -32,7 +26,6 @@ typedef char* LPSTR;
 typedef DWORD* PDWORD;
 typedef SIZE_T ULONG_PTR;
 
-/* Struct for native 32-bit processes */
 typedef struct {
     PVOID BaseAddress;
     PVOID AllocationBase;
@@ -41,18 +34,21 @@ typedef struct {
     DWORD State;
     DWORD Protect;
     DWORD Type;
-} MEMORY_BASIC_INFORMATION, *PMEMORY_BASIC_INFORMATION;
+} MEMORY_BASIC_INFORMATION32, *PMEMORY_BASIC_INFORMATION32;
 
-/* Struct for 32-bit process querying a 64-bit process (WoW64) */
 typedef struct {
     PVOID BaseAddress;
     PVOID AllocationBase;
     DWORD AllocationProtect;
-    DWORD RegionSize;
+    DWORD __alignment1;
+    SIZE_T RegionSize;
     DWORD State;
     DWORD Protect;
     DWORD Type;
-} MEMORY_BASIC_INFORMATION32, *PMEMORY_BASIC_INFORMATION32;
+    DWORD __alignment2;
+} MEMORY_BASIC_INFORMATION64, *PMEMORY_BASIC_INFORMATION64;
+
+typedef MEMORY_BASIC_INFORMATION32 MEMORY_BASIC_INFORMATION;
 
 typedef struct {
     DWORD LowPart;
@@ -79,9 +75,7 @@ BOOL CloseHandle(HANDLE hObject);
 BOOL IsWow64Process(HANDLE hProcess, BOOL* Wow64Process);
 HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
 BOOL ReadProcessMemory(HANDLE hProcess, PVOID lpBaseAddress, PVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead);
-NTSTATUS NtReadVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, PVOID Buffer, SIZE_T BufferSize, SIZE_T* NumberOfBytesRead);
-ULONG RtlNtStatusToDosError(NTSTATUS Status);
-void RtlSetLastWin32ErrorAndNtStatusFromNtStatus(NTSTATUS Status);
+BOOL ReadProcessMemory(HANDLE hProcess, PVOID lpBaseAddress, PVOID lpBuffer, SIZE_T nSize, SIZE_T* lpNumberOfBytesRead);
 BOOL OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess, HANDLE* TokenHandle);
 BOOL LookupPrivilegeValueA(const char* lpSystemName, const char* lpName, LUID* lpLuid);
 BOOL AdjustTokenPrivileges(HANDLE TokenHandle, BOOL DisableAllPrivileges, TOKEN_PRIVILEGES* NewState, DWORD BufferLength, TOKEN_PRIVILEGES* PreviousState, DWORD* ReturnLength);
@@ -94,55 +88,14 @@ typedef struct {
     DWORD SizeOfImage;
     PVOID EntryPoint;
 } MODULEINFO, *LPMODULEINFO;
-typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(void* ExceptionInfo);
-PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler);
-ULONG RemoveVectoredExceptionHandler(PVOID Handler);
-typedef struct {
-    DWORD ExceptionCode;
-    DWORD ExceptionFlags;
-    void* ExceptionRecord;
-    PVOID ExceptionAddress;
-    DWORD NumberParameters;
-    ULONG_PTR ExceptionInformation[15];
-} EXCEPTION_RECORD;
-typedef struct {
-    EXCEPTION_RECORD ExceptionRecord;
-    void* ContextRecord;
-} EXCEPTION_POINTERS;
 ]]
 
 local kernel32 = ffi.load("kernel32")
-local ntdll = ffi.load("ntdll")
 local advapi32 = ffi.load("advapi32")
 local psapi = ffi.load("psapi")
 
 -- === Exception handling infrastructure ===
-local EXCEPTION_CONTINUE_EXECUTION = -1
-local EXCEPTION_CONTINUE_SEARCH = 0
-local ENABLE_VEH = false  -- disable by default for standalone runs; VS Code debugger can re-enable if needed
 local exceptionOccurred = false
-local lastExceptionAddress = nil
-local lastExceptionCode = nil
-
--- Robust exception handler for access violations during memory reads
-local function exceptionHandler(exceptionPointers)
-    local pExceptionPointers = ffi.cast("EXCEPTION_POINTERS*", exceptionPointers)
-    local exceptionRecord = pExceptionPointers.ExceptionRecord
-    local exceptionCode = tonumber(exceptionRecord.ExceptionCode)
-
-    lastExceptionCode = exceptionCode
-    lastExceptionAddress = tonumber(ffi.cast("intptr_t", exceptionRecord.ExceptionAddress))
-    
-    if exceptionCode == STATUS_ACCESS_VIOLATION then
-        exceptionOccurred = true
-        if ENABLE_VEH then
-            -- Resume execution so the read wrapper can inspect the failure state
-            return EXCEPTION_CONTINUE_EXECUTION
-        end
-    end
-
-    return EXCEPTION_CONTINUE_SEARCH
-end
 
 -- === Configuration ===
 local SEARCH_STRING = "password"       -- change as needed
@@ -172,6 +125,10 @@ local PAGE_EXECUTE_WRITECOPY = 0x80
 local STATUS_SUCCESS = 0x00000000
 local STATUS_PARTIAL_COPY = 0x8000000D
 local STATUS_ACCESS_VIOLATION = 0xC0000005
+
+-- === Utility helpers ===
+local TOKEN_QUERY = 0x0008
+local SE_PRIVILEGE_ENABLED = 0x00000002
 
 local TOKEN_ADJUST_PRIVILEGES = 0x0020
 local TOKEN_QUERY = 0x0008
@@ -219,13 +176,6 @@ local function enableDebugPrivilege()
     return true
 end
 
-local function statusToString(status)
-    if status == STATUS_SUCCESS then return "STATUS_SUCCESS" end
-    if status == STATUS_PARTIAL_COPY then return "STATUS_PARTIAL_COPY" end
-    if status == STATUS_ACCESS_VIOLATION then return "STATUS_ACCESS_VIOLATION" end
-    return string.format("0x%08X", status)
-end
-
 local function writeLog(logFile, message)
     logFile:write(message)
     logFile:flush()
@@ -260,65 +210,39 @@ local function isReadableProtection(protect)
     return bit.band(protect, readable) ~= 0
 end
 
--- Helper function to read memory safely with exception protection
-local function safeNtRead(processHandle, address, size)
-    -- Validate parameters
+local function safeRead(processHandle, address, size)
     if size <= 0 or size > CHUNK_SIZE * 4 then
-        return nil, STATUS_ACCESS_VIOLATION
+        return nil, false
     end
     
     local buffer = ffi.new("uint8_t[?]", size)
     local bytesRead = ffi.new("SIZE_T[1]")
     
-    -- Reset exception tracking
-    exceptionOccurred = false
-    lastExceptionAddress = nil
-    lastExceptionCode = nil
-    
-    -- Perform read with pcall protection
-    local success, statusOrErr = pcall(function()
-        return ntdll.NtReadVirtualMemory(processHandle, ffi.cast("PVOID", address), buffer, size, bytesRead)
+    local success, result = pcall(function()
+        return kernel32.ReadProcessMemory(processHandle, ffi.cast("PVOID", address), buffer, size, bytesRead)
     end)
     
-    -- Check for Lua-level errors
     if not success then
-        debugLog("  NtReadVirtualMemory pcall raised at 0x%08X: %s\n", address, tostring(statusOrErr))
-        return nil, STATUS_ACCESS_VIOLATION
-    end
-
-    local status = statusOrErr
-    
-    -- Check for exceptions caught by VEH
-    if exceptionOccurred then
-        debugLog("  VEH intercepted access at 0x%08X (read target 0x%08X)\n", tonumber(lastExceptionAddress or 0), address)
-        return nil, STATUS_ACCESS_VIOLATION
-    end
-
-    if lastExceptionCode and lastExceptionCode ~= STATUS_ACCESS_VIOLATION then
-        debugLog("  VEH observed exception 0x%08X at 0x%08X during read 0x%08X\n", lastExceptionCode, tonumber(lastExceptionAddress or 0), address)
+        debugLog("  ReadProcessMemory pcall raised at 0x%08X: %s\n", address, tostring(result))
+        return nil, false
     end
     
-    -- Check NTSTATUS return
-    if status ~= STATUS_SUCCESS and status ~= STATUS_PARTIAL_COPY then
-        debugLog("  NtReadVirtualMemory returned %s at 0x%08X\n", statusToString(status), address)
-        return nil, status
+    if result == 0 then
+        return nil, false
     end
     
-    -- Validate bytes read
     local actualBytesRead = tonumber(bytesRead[0])
     if actualBytesRead == 0 or actualBytesRead > size then
-        debugLog("  NtReadVirtualMemory reported invalid byte count (%d) at 0x%08X\n", actualBytesRead or -1, address)
-        return nil, STATUS_PARTIAL_COPY
-    end
-
-    -- Safe string conversion with pcall
-    local strSuccess, result = pcall(ffi.string, buffer, actualBytesRead)
-    if not strSuccess then
-        debugLog("  ffi.string failed at 0x%08X: %s\n", address, tostring(result))
-        return nil, STATUS_ACCESS_VIOLATION
+        return nil, false
     end
     
-    return result, status
+    local strSuccess, strResult = pcall(ffi.string, buffer, actualBytesRead)
+    if not strSuccess then
+        debugLog("  ffi.string failed at 0x%08X: %s\n", address, tostring(strResult))
+        return nil, false
+    end
+    
+    return strResult, true
 end
 
 local function hexdump(data, baseAddr, highlightOffset, highlightLen)
@@ -382,7 +306,7 @@ local function makeContext(processHandle, regionBase, regionEnd, matchAddr, matc
         endAddr = startAddr + size
     end
     
-    local data, status = safeNtRead(processHandle, startAddr, size)
+    local data, ok = safeRead(processHandle, startAddr, size)
     if not data or #data == 0 then
         return nil, status
     end
@@ -503,7 +427,7 @@ local function scanRegion(processHandle, logFile, baseAddr, regionSize, searcher
     while offset < regionSize do
         local toRead = math.min(CHUNK_SIZE, regionSize - offset)
         local readAddr = baseAddr + offset
-        local chunk, status = safeNtRead(processHandle, readAddr, toRead)
+        local chunk, ok = safeRead(processHandle, readAddr, toRead)
 
         if chunk and #chunk > 0 then
             consecutiveFailures = 0  -- Reset failure counter on success
@@ -622,30 +546,10 @@ local function logLoadedModules(processHandle, logFile)
     end
 end
 
--- Global to prevent garbage collection of VEH callback
-local _veh_callback_anchor = nil
-
--- Main execution with comprehensive error handling
 function main()
     local logFile = assert(io.open(LOG_PATH, "a"))
     writeLog(logFile, "\n--------------------------------------------------\n")
     currentLogFile = logFile
-
-    -- Install VEH exception handler with proper callback preservation
-    -- CRITICAL: Store callback in global to prevent GC during execution
-    local handler = nil
-    if ENABLE_VEH then
-        _veh_callback_anchor = ffi.cast("PVECTORED_EXCEPTION_HANDLER", exceptionHandler)
-        handler = kernel32.AddVectoredExceptionHandler(1, _veh_callback_anchor)  -- 1 = first handler
-
-        if handler == nil or tonumber(ffi.cast("intptr_t", handler)) == 0 then
-            writeLog(logFile, "WARNING: Failed to install VEH exception handler\n")
-        else
-            writeLog(logFile, string.format("VEH exception handler installed at 0x%08X\n", tonumber(ffi.cast("intptr_t", handler))))
-        end
-    else
-        writeLog(logFile, "VEH exception handler disabled for this run\n")
-    end
 
     local function getProcessName(pHandle)
         local size = ffi.new("DWORD[1]", 260)
@@ -733,7 +637,7 @@ function main()
         if use32bitStruct then
             mbi = ffi.new("MEMORY_BASIC_INFORMATION32")
         else
-            mbi = ffi.new("MEMORY_BASIC_INFORMATION")
+            mbi = ffi.new("MEMORY_BASIC_INFORMATION64")
         end
 
         local result = kernel32.VirtualQueryEx(processHandle, ffi.cast("PVOID", address), mbi, ffi.sizeof(mbi))
@@ -816,11 +720,6 @@ function main()
     end
 
     logLoadedModules(processHandle, logFile)
-
-    if ENABLE_VEH and handler ~= nil then
-        kernel32.RemoveVectoredExceptionHandler(handler)
-        _veh_callback_anchor = nil
-    end
 
     kernel32.CloseHandle(processHandle)
 
