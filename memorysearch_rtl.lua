@@ -96,6 +96,7 @@ typedef struct {
 } MODULEINFO, *LPMODULEINFO;
 typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(void* ExceptionInfo);
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler);
+ULONG RemoveVectoredExceptionHandler(PVOID Handler);
 typedef struct {
     DWORD ExceptionCode;
     DWORD ExceptionFlags;
@@ -118,6 +119,7 @@ local psapi = ffi.load("psapi")
 -- === Exception handling infrastructure ===
 local EXCEPTION_CONTINUE_EXECUTION = -1
 local EXCEPTION_CONTINUE_SEARCH = 0
+local ENABLE_VEH = false  -- disable by default for standalone runs; VS Code debugger can re-enable if needed
 local exceptionOccurred = false
 local lastExceptionAddress = nil
 local lastExceptionCode = nil
@@ -133,9 +135,12 @@ local function exceptionHandler(exceptionPointers)
     
     if exceptionCode == STATUS_ACCESS_VIOLATION then
         exceptionOccurred = true
-        return EXCEPTION_CONTINUE_EXECUTION
+        if ENABLE_VEH then
+            -- Resume execution so the read wrapper can inspect the failure state
+            return EXCEPTION_CONTINUE_EXECUTION
+        end
     end
-    
+
     return EXCEPTION_CONTINUE_SEARCH
 end
 
@@ -628,13 +633,18 @@ function main()
 
     -- Install VEH exception handler with proper callback preservation
     -- CRITICAL: Store callback in global to prevent GC during execution
-    _veh_callback_anchor = ffi.cast("PVECTORED_EXCEPTION_HANDLER", exceptionHandler)
-    local handler = kernel32.AddVectoredExceptionHandler(1, _veh_callback_anchor)  -- 1 = first handler
-    
-    if handler == nil or tonumber(ffi.cast("intptr_t", handler)) == 0 then
-        writeLog(logFile, "WARNING: Failed to install VEH exception handler\n")
+    local handler = nil
+    if ENABLE_VEH then
+        _veh_callback_anchor = ffi.cast("PVECTORED_EXCEPTION_HANDLER", exceptionHandler)
+        handler = kernel32.AddVectoredExceptionHandler(1, _veh_callback_anchor)  -- 1 = first handler
+
+        if handler == nil or tonumber(ffi.cast("intptr_t", handler)) == 0 then
+            writeLog(logFile, "WARNING: Failed to install VEH exception handler\n")
+        else
+            writeLog(logFile, string.format("VEH exception handler installed at 0x%08X\n", tonumber(ffi.cast("intptr_t", handler))))
+        end
     else
-        writeLog(logFile, string.format("VEH exception handler installed at 0x%08X\n", tonumber(ffi.cast("intptr_t", handler))))
+        writeLog(logFile, "VEH exception handler disabled for this run\n")
     end
 
     local function getProcessName(pHandle)
@@ -806,6 +816,11 @@ function main()
     end
 
     logLoadedModules(processHandle, logFile)
+
+    if ENABLE_VEH and handler ~= nil then
+        kernel32.RemoveVectoredExceptionHandler(handler)
+        _veh_callback_anchor = nil
+    end
 
     kernel32.CloseHandle(processHandle)
 
