@@ -16,6 +16,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <system_error>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -68,6 +69,198 @@ namespace
 constexpr int kInstructionSampleInterval = 1;
 constexpr const char* kProgramTitle = "Offensive LuaJIT Debugger";
 static int gDebuggerRegistryKey = 0;
+
+[[nodiscard]] std::string describeExceptionCode(DWORD code)
+{
+	switch (code)
+	{
+	case EXCEPTION_ACCESS_VIOLATION: return "EXCEPTION_ACCESS_VIOLATION";
+	case EXCEPTION_STACK_OVERFLOW: return "EXCEPTION_STACK_OVERFLOW";
+	case EXCEPTION_INT_DIVIDE_BY_ZERO: return "EXCEPTION_INT_DIVIDE_BY_ZERO";
+	case EXCEPTION_ILLEGAL_INSTRUCTION: return "EXCEPTION_ILLEGAL_INSTRUCTION";
+	case EXCEPTION_PRIV_INSTRUCTION: return "EXCEPTION_PRIV_INSTRUCTION";
+	case EXCEPTION_IN_PAGE_ERROR: return "EXCEPTION_IN_PAGE_ERROR";
+	default:
+		{
+			std::ostringstream oss;
+			oss << "0x" << std::hex << std::uppercase << code;
+			return oss.str();
+		}
+	}
+}
+
+int reportStructuredException(EXCEPTION_POINTERS* info)
+{
+	if (!info || !info->ExceptionRecord)
+	{
+		const char* msg = "[seh] Unknown structured exception (no info)";
+		std::cerr << msg << std::endl;
+#ifdef _WIN32
+		OutputDebugStringA(msg);
+		OutputDebugStringA("\n");
+#endif
+		return EXCEPTION_EXECUTE_HANDLER;
+	}
+
+	const auto& record = *info->ExceptionRecord;
+	const auto code = record.ExceptionCode;
+	std::ostringstream oss;
+	oss << std::hex << std::uppercase << std::setfill('0');
+	oss << "[seh] Exception " << describeExceptionCode(code)
+		<< " (0x" << std::setw(8) << code << ") at 0x"
+#if defined(_WIN64)
+		<< std::setw(16)
+#else
+		<< std::setw(8)
+#endif
+		<< reinterpret_cast<std::uintptr_t>(record.ExceptionAddress);
+
+	const auto header = oss.str();
+	std::cerr << header << std::endl;
+#ifdef _WIN32
+	OutputDebugStringA(header.c_str());
+	OutputDebugStringA("\n");
+#endif
+
+	std::ostringstream flagsStream;
+	flagsStream << "[seh] Flags: 0x" << std::hex << std::setw(8) << record.ExceptionFlags
+			   << std::dec << ", Parameters: " << record.NumberParameters;
+	const auto flagsStr = flagsStream.str();
+	std::cerr << flagsStr << std::endl;
+#ifdef _WIN32
+	OutputDebugStringA(flagsStr.c_str());
+	OutputDebugStringA("\n");
+#endif
+
+	if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR)
+	{
+		if (record.NumberParameters >= 2)
+		{
+			const auto accessType = record.ExceptionInformation[0];
+			const auto faultAddress = record.ExceptionInformation[1];
+			const char* accessLabel = (accessType == 0) ? "read" : (accessType == 1) ? "write" : "execute";
+			std::ostringstream accessStream;
+			accessStream << "[seh] Access type: " << accessLabel
+					   << ", Fault address: 0x" << std::hex
+#if defined(_WIN64)
+					   << std::setw(16)
+#else
+					   << std::setw(8)
+#endif
+					   << faultAddress << std::dec;
+			const auto accessStr = accessStream.str();
+			std::cerr << accessStr << std::endl;
+#ifdef _WIN32
+			OutputDebugStringA(accessStr.c_str());
+			OutputDebugStringA("\n");
+#endif
+		}
+		if (code == EXCEPTION_IN_PAGE_ERROR && record.NumberParameters >= 3)
+		{
+			const auto ntStatus = static_cast<DWORD>(record.ExceptionInformation[2]);
+			std::ostringstream ntStream;
+			ntStream << "[seh] NTSTATUS: 0x" << std::hex << std::setw(8) << ntStatus << std::dec;
+			const auto ntStr = ntStream.str();
+			std::cerr << ntStr << std::endl;
+#ifdef _WIN32
+			OutputDebugStringA(ntStr.c_str());
+			OutputDebugStringA("\n");
+#endif
+		}
+	}
+
+	const DWORD lastError = GetLastError();
+	if (lastError != 0)
+	{
+		std::error_code ec(static_cast<int>(lastError), std::system_category());
+		std::ostringstream lastErrStream;
+		lastErrStream << "[seh] GetLastError(): " << lastError << " (" << ec.message() << ")";
+		const auto lastErrStr = lastErrStream.str();
+		std::cerr << lastErrStr << std::endl;
+#ifdef _WIN32
+		OutputDebugStringA(lastErrStr.c_str());
+		OutputDebugStringA("\n");
+#endif
+	}
+
+	std::cerr.flush();
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+int reportDebuggerException(const char* context, EXCEPTION_POINTERS* info)
+{
+	if (context != nullptr)
+	{
+		std::ostringstream msg;
+		msg << "[debugger] Structured exception inside " << context;
+		const auto text = msg.str();
+		std::cerr << text << std::endl;
+#ifdef _WIN32
+		OutputDebugStringA(text.c_str());
+		OutputDebugStringA("\n");
+#endif
+	}
+	else
+	{
+		const char* defaultMsg = "[debugger] Structured exception in debugger hook";
+		std::cerr << defaultMsg << std::endl;
+#ifdef _WIN32
+		OutputDebugStringA(defaultMsg);
+		OutputDebugStringA("\n");
+#endif
+	}
+
+	return reportStructuredException(info);
+}
+
+struct LuaCallResult
+{
+	int status;
+	DWORD exceptionCode;
+	bool exceptionOccurred;
+};
+
+#ifdef _WIN32
+LuaCallResult guardedLuaPCall(lua_State* L)
+{
+	LuaCallResult result{LUA_ERRRUN, 0, false};
+	__try
+	{
+		result.status = lua_pcall(L, 0, LUA_MULTRET, 0);
+	}
+	__except (reportStructuredException(GetExceptionInformation()))
+	{
+		result.exceptionOccurred = true;
+		result.exceptionCode = GetExceptionCode();
+	}
+	return result;
+}
+
+bool guardedLuaGetInfo(lua_State* state, lua_Debug* ar, const char* what)
+{
+	bool success = false;
+	bool exception = false;
+	__try
+	{
+		success = lua_getinfo(state, what, ar) != 0;
+	}
+	__except (reportDebuggerException(what, GetExceptionInformation()))
+	{
+		exception = true;
+	}
+	return !exception && success;
+}
+#else
+LuaCallResult guardedLuaPCall(lua_State* L)
+{
+	return { lua_pcall(L, 0, LUA_MULTRET, 0), 0u, false };
+}
+
+bool guardedLuaGetInfo(lua_State* state, lua_Debug* ar, const char* what)
+{
+	return lua_getinfo(state, what, ar) != 0;
+}
+#endif
 
 struct DebugConfig
 {
@@ -642,7 +835,19 @@ private:
 
 	void handleLineEvent(lua_State* state, lua_Debug* ar)
 	{
-		lua_getinfo(state, "Sln", ar);
+		// Request only source and line data during high-frequency line hooks to
+		// minimise lua_getinfo work; name resolution ('n') is deferred to
+		// on-demand inspectors where stability matters more than throughput.
+		if (!safeLuaGetInfo(state, ar, "Sl"))
+		{
+			std::cerr << "[debugger] Disabling hooks after lua_getinfo failure" << std::endl;
+#ifdef _WIN32
+			OutputDebugStringA("[debugger] Disabling hooks after lua_getinfo failure\n");
+#endif
+			lua_sethook(state, nullptr, 0, 0);
+			hooksActive = false;
+			return;
+		}
 		const auto location = extractLocation(*ar);
 		if (!location.displayPath.empty())
 		{
@@ -842,7 +1047,11 @@ private:
 	void dumpCurrentFunctionBytecode(lua_Debug* ar)
 	{
 		ScopedHookPause pause(*this);
-		lua_getinfo(L, "f", ar);
+		if (!safeLuaGetInfo(L, ar, "f"))
+		{
+			std::cout << "[warn] Unable to resolve current function context." << std::endl;
+			return;
+		}
 		ScopedStackGuard guard(L, lua_gettop(L));
 		if (lua_isfunction(L, -1) == 0)
 		{
@@ -1104,7 +1313,11 @@ private:
 	void listUpvalues(lua_Debug* ar)
 	{
 		ScopedHookPause pause(*this);
-		lua_getinfo(L, "f", ar);
+		if (!safeLuaGetInfo(L, ar, "f"))
+		{
+			std::cout << "[warn] Unable to access upvalues; lua_getinfo failed." << std::endl;
+			return;
+		}
 		ScopedStackGuard guard(L, lua_gettop(L));
 		if (lua_isfunction(L, -1) == 0)
 		{
@@ -1185,7 +1398,11 @@ private:
 		lua_Debug info{};
 		for (int level = 0; lua_getstack(L, level, &info) != 0; ++level)
 		{
-			lua_getinfo(L, "Sln", &info);
+			if (!safeLuaGetInfo(L, &info, "Sln"))
+			{
+				std::cout << "  [warn] Stack trace truncated; lua_getinfo failed." << std::endl;
+				break;
+			}
 			std::string functionName = info.name ? info.name : "<anonymous>";
 			const auto location = extractLocation(info);
 			std::cout << "  [" << level << "] " << functionName;
@@ -1346,6 +1563,11 @@ private:
 		}
 		return candidate;
 	}
+
+	bool safeLuaGetInfo(lua_State* state, lua_Debug* ar, const char* what)
+	{
+		return guardedLuaGetInfo(state, ar, what);
+	}
 };
 
 class LuaApplication
@@ -1382,7 +1604,22 @@ public:
 		debugger.beforeExecution();
 
 		vmInstrumentation.recordExecutionStart();
-		const int status = lua_pcall(luaState.get(), 0, LUA_MULTRET, 0);
+		const LuaCallResult callResult = guardedLuaPCall(luaState.get());
+		int status = callResult.status;
+#ifdef _WIN32
+		if (callResult.exceptionOccurred)
+		{
+			std::ostringstream msg;
+			msg << "[fatal] Windows exception captured during Lua execution (0x"
+				<< std::hex << std::uppercase << std::setfill('0') << std::setw(8)
+				<< callResult.exceptionCode << std::dec << ")";
+			const auto text = msg.str();
+			std::cerr << text << std::endl;
+			OutputDebugStringA(text.c_str());
+			OutputDebugStringA("\n");
+			status = LUA_ERRRUN;
+		}
+#endif
 		vmInstrumentation.recordExecutionEnd();
 		
 		debugger.afterExecution(status);

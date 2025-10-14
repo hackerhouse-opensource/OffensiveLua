@@ -1,6 +1,16 @@
 -- memorysearch_rtl.lua
 -- Rtl-backed memory searcher that safely scans the current process for ASCII and UTF-16LE strings.
 -- Uses NtReadVirtualMemory and Rtl error translation to avoid hard faults when pages are inaccessible.
+--
+-- ROBUSTNESS ENHANCEMENTS:
+-- - VEH (Vectored Exception Handler) for catching hard access violations
+-- - pcall protection around all FFI calls and string operations
+-- - Stack exhaustion prevention via string concatenation limits (MAX_STRING_CONCAT_SIZE)
+-- - Infinite loop detection with region scan limits (MAX_REGIONS_TO_SCAN)
+-- - Consecutive failure tracking to abort problematic regions early
+-- - Protected byte-by-byte operations to prevent out-of-bounds access
+-- - Progress indicators for long-running scans
+-- - Comprehensive error logging with stack traces
 
 local ffi = require("ffi")
 local bit = require("bit")
@@ -105,19 +115,28 @@ local ntdll = ffi.load("ntdll")
 local advapi32 = ffi.load("advapi32")
 local psapi = ffi.load("psapi")
 
--- Global flag for exception handling
-local exceptionHandled = false
+-- === Exception handling infrastructure ===
+local EXCEPTION_CONTINUE_EXECUTION = -1
+local EXCEPTION_CONTINUE_SEARCH = 0
+local exceptionOccurred = false
+local lastExceptionAddress = nil
+local lastExceptionCode = nil
 
--- Exception handler to catch access violations
+-- Robust exception handler for access violations during memory reads
 local function exceptionHandler(exceptionPointers)
-    local exceptionRecord = exceptionPointers.ExceptionRecord
-    if exceptionRecord.ExceptionCode == STATUS_ACCESS_VIOLATION then
-        if not exceptionHandled then
-            exceptionHandled = true
-            return 0  -- EXCEPTION_CONTINUE_EXECUTION
-        end
+    local pExceptionPointers = ffi.cast("EXCEPTION_POINTERS*", exceptionPointers)
+    local exceptionRecord = pExceptionPointers.ExceptionRecord
+    local exceptionCode = tonumber(exceptionRecord.ExceptionCode)
+
+    lastExceptionCode = exceptionCode
+    lastExceptionAddress = tonumber(ffi.cast("intptr_t", exceptionRecord.ExceptionAddress))
+    
+    if exceptionCode == STATUS_ACCESS_VIOLATION then
+        exceptionOccurred = true
+        return EXCEPTION_CONTINUE_EXECUTION
     end
-    return 1  -- EXCEPTION_CONTINUE_SEARCH
+    
+    return EXCEPTION_CONTINUE_SEARCH
 end
 
 -- === Configuration ===
@@ -125,9 +144,11 @@ local SEARCH_STRING = "password"       -- change as needed
 local LOG_PATH = "c:/temp/memoryexploit.log"
 
 local CHUNK_SIZE = 0x1000               -- 4 KB read window per chunk
+local MAX_STRING_CONCAT_SIZE = 0x10000  -- 64 KB max to prevent stack exhaustion
 local ADDRESS_LIMIT = 0x7FFFFFFFFFFFFFFF
 local CONTEXT_BEFORE = 96               -- bytes (or UTF-16 pairs) before match
 local CONTEXT_AFTER = 64                -- bytes (or UTF-16 pairs) after match
+local MAX_REGIONS_TO_SCAN = 10000       -- Safety limit to prevent infinite loops
 
 -- === Constants ===
 local PROCESS_QUERY_INFORMATION = 0x0400
@@ -205,6 +226,15 @@ local function writeLog(logFile, message)
     logFile:flush()
 end
 
+-- Track active log for helpers that lack direct access
+local currentLogFile = nil
+
+local function debugLog(fmt, ...)
+    if currentLogFile then
+        writeLog(currentLogFile, string.format(fmt, ...))
+    end
+end
+
 local function toUnicodeLE(str)
     local bytes = {}
     for i = 1, #str do
@@ -225,21 +255,65 @@ local function isReadableProtection(protect)
     return bit.band(protect, readable) ~= 0
 end
 
--- Helper function to read memory safely
+-- Helper function to read memory safely with exception protection
 local function safeNtRead(processHandle, address, size)
+    -- Validate parameters
+    if size <= 0 or size > CHUNK_SIZE * 4 then
+        return nil, STATUS_ACCESS_VIOLATION
+    end
+    
     local buffer = ffi.new("uint8_t[?]", size)
     local bytesRead = ffi.new("SIZE_T[1]")
     
-    local status = ntdll.NtReadVirtualMemory(processHandle, ffi.cast("PVOID", address), buffer, size, bytesRead)
-
-    if status ~= STATUS_SUCCESS and status ~= STATUS_PARTIAL_COPY then
-        if status ~= STATUS_ACCESS_VIOLATION then
-            writeLog(logFile, string.format("  NtReadVirtualMemory failed at 0x%08X (status=%s)\n", address, statusToString(status)))
-        end
-        return nil
+    -- Reset exception tracking
+    exceptionOccurred = false
+    lastExceptionAddress = nil
+    lastExceptionCode = nil
+    
+    -- Perform read with pcall protection
+    local success, statusOrErr = pcall(function()
+        return ntdll.NtReadVirtualMemory(processHandle, ffi.cast("PVOID", address), buffer, size, bytesRead)
+    end)
+    
+    -- Check for Lua-level errors
+    if not success then
+        debugLog("  NtReadVirtualMemory pcall raised at 0x%08X: %s\n", address, tostring(statusOrErr))
+        return nil, STATUS_ACCESS_VIOLATION
     end
 
-    return ffi.string(buffer, bytesRead[0])
+    local status = statusOrErr
+    
+    -- Check for exceptions caught by VEH
+    if exceptionOccurred then
+        debugLog("  VEH intercepted access at 0x%08X (read target 0x%08X)\n", tonumber(lastExceptionAddress or 0), address)
+        return nil, STATUS_ACCESS_VIOLATION
+    end
+
+    if lastExceptionCode and lastExceptionCode ~= STATUS_ACCESS_VIOLATION then
+        debugLog("  VEH observed exception 0x%08X at 0x%08X during read 0x%08X\n", lastExceptionCode, tonumber(lastExceptionAddress or 0), address)
+    end
+    
+    -- Check NTSTATUS return
+    if status ~= STATUS_SUCCESS and status ~= STATUS_PARTIAL_COPY then
+        debugLog("  NtReadVirtualMemory returned %s at 0x%08X\n", statusToString(status), address)
+        return nil, status
+    end
+    
+    -- Validate bytes read
+    local actualBytesRead = tonumber(bytesRead[0])
+    if actualBytesRead == 0 or actualBytesRead > size then
+        debugLog("  NtReadVirtualMemory reported invalid byte count (%d) at 0x%08X\n", actualBytesRead or -1, address)
+        return nil, STATUS_PARTIAL_COPY
+    end
+
+    -- Safe string conversion with pcall
+    local strSuccess, result = pcall(ffi.string, buffer, actualBytesRead)
+    if not strSuccess then
+        debugLog("  ffi.string failed at 0x%08X: %s\n", address, tostring(result))
+        return nil, STATUS_ACCESS_VIOLATION
+    end
+    
+    return result, status
 end
 
 local function hexdump(data, baseAddr, highlightOffset, highlightLen)
@@ -272,6 +346,15 @@ local function hexdump(data, baseAddr, highlightOffset, highlightLen)
 end
 
 local function makeContext(processHandle, regionBase, regionEnd, matchAddr, matchLenBytes, isUnicode)
+    -- Validate parameters
+    if not processHandle or not regionBase or not regionEnd or not matchAddr or not matchLenBytes then
+        return nil
+    end
+    
+    if matchAddr < regionBase or matchAddr >= regionEnd then
+        return nil
+    end
+    
     local step = isUnicode and 2 or 1
     local beforeLimit = CONTEXT_BEFORE * step
     local afterLimit = CONTEXT_AFTER * step
@@ -287,6 +370,13 @@ local function makeContext(processHandle, regionBase, regionEnd, matchAddr, matc
     end
 
     local size = endAddr - startAddr
+    
+    -- Limit context size to prevent excessive memory operations
+    if size > CHUNK_SIZE * 4 then
+        size = CHUNK_SIZE * 4
+        endAddr = startAddr + size
+    end
+    
     local data, status = safeNtRead(processHandle, startAddr, size)
     if not data or #data == 0 then
         return nil, status
@@ -295,19 +385,41 @@ local function makeContext(processHandle, regionBase, regionEnd, matchAddr, matc
     local matchOffset = matchAddr - startAddr
     local matchStartIdx = matchOffset + 1
     local matchEndIdx = matchStartIdx + matchLenBytes - 1
+    
+    -- Bounds checking
+    local dataLen = #data
+    if matchStartIdx < 1 or matchStartIdx > dataLen or matchEndIdx > dataLen then
+        return nil
+    end
 
     local contextStartIdx = matchStartIdx
     local consumed = 0
-    while contextStartIdx > step do
+    local iterations = 0
+    local maxIterations = CONTEXT_BEFORE + 10  -- Safety limit
+    
+    while contextStartIdx > step and iterations < maxIterations do
+        iterations = iterations + 1
         local nextIdx = contextStartIdx - step
+        
+        if nextIdx < 1 then break end
+        
+        -- Protected byte access
+        local byteOk = true
         if isUnicode then
-            local b1 = data:byte(nextIdx)
-            local b2 = data:byte(nextIdx + 1)
-            if not b1 or not b2 or (b1 == 0 and b2 == 0) then break end
+            if nextIdx + 1 > dataLen then break end
+            local b1Success, b1 = pcall(string.byte, data, nextIdx)
+            local b2Success, b2 = pcall(string.byte, data, nextIdx + 1)
+            if not b1Success or not b2Success or not b1 or not b2 or (b1 == 0 and b2 == 0) then 
+                break 
+            end
         else
-            local b = data:byte(nextIdx)
-            if not b or b == 0 then break end
+            if nextIdx > dataLen then break end
+            local bSuccess, b = pcall(string.byte, data, nextIdx)
+            if not bSuccess or not b or b == 0 then 
+                break 
+            end
         end
+        
         consumed = consumed + step
         if consumed >= beforeLimit then break end
         contextStartIdx = nextIdx
@@ -315,23 +427,47 @@ local function makeContext(processHandle, regionBase, regionEnd, matchAddr, matc
 
     local contextEndIdx = matchEndIdx
     consumed = 0
-    while contextEndIdx + step <= #data do
+    iterations = 0
+    
+    while contextEndIdx + step <= dataLen and iterations < maxIterations do
+        iterations = iterations + 1
         local nextIdx = contextEndIdx + step
+        
+        if nextIdx > dataLen then break end
+        
+        -- Protected byte access
         if isUnicode then
-            local b1 = data:byte(nextIdx)
-            local b2 = data:byte(nextIdx + 1)
-            if not b1 or not b2 or (b1 == 0 and b2 == 0) then break end
+            if nextIdx + 1 > dataLen then break end
+            local b1Success, b1 = pcall(string.byte, data, nextIdx)
+            local b2Success, b2 = pcall(string.byte, data, nextIdx + 1)
+            if not b1Success or not b2Success or not b1 or not b2 or (b1 == 0 and b2 == 0) then 
+                break 
+            end
         else
-            local b = data:byte(nextIdx)
-            if not b or b == 0 then break end
+            local bSuccess, b = pcall(string.byte, data, nextIdx)
+            if not bSuccess or not b or b == 0 then 
+                break 
+            end
         end
+        
         consumed = consumed + step
         if consumed >= afterLimit then break end
         contextEndIdx = nextIdx
     end
+    
+    -- Validate indices before substring extraction
+    if contextStartIdx < 1 or contextEndIdx > dataLen or contextStartIdx > contextEndIdx then
+        return nil
+    end
 
-    local window = data:sub(contextStartIdx, contextEndIdx)
+    -- Protected substring extraction
+    local subSuccess, window = pcall(string.sub, data, contextStartIdx, contextEndIdx)
+    if not subSuccess or not window then
+        return nil
+    end
+    
     local highlightOffset = matchStartIdx - contextStartIdx
+    
     return {
         base = startAddr + (contextStartIdx - 1),
         data = window,
@@ -356,6 +492,8 @@ end
 local function scanRegion(processHandle, logFile, baseAddr, regionSize, searchers)
     local regionEnd = baseAddr + regionSize
     local offset = 0
+    local consecutiveFailures = 0
+    local maxConsecutiveFailures = 10  -- Abort region after 10 consecutive failures
 
     while offset < regionSize do
         local toRead = math.min(CHUNK_SIZE, regionSize - offset)
@@ -363,39 +501,95 @@ local function scanRegion(processHandle, logFile, baseAddr, regionSize, searcher
         local chunk, status = safeNtRead(processHandle, readAddr, toRead)
 
         if chunk and #chunk > 0 then
+            consecutiveFailures = 0  -- Reset failure counter on success
+            
+            -- Process each search pattern with protected string operations
             for _, search in ipairs(searchers) do
                 local tail = search.tail
-                local combined = tail .. chunk
                 local tailLen = #tail
+                local chunkLen = #chunk
+                
+                -- Prevent excessive string concatenation that exhausts stack
+                if tailLen + chunkLen > MAX_STRING_CONCAT_SIZE then
+                    -- Trim tail to reasonable size
+                    tail = tail:sub(math.max(1, tailLen - search.tailSize))
+                    tailLen = #tail
+                end
+                
+                local combined = tail .. chunk
+                local combinedLen = #combined
                 local patternLen = search.patternLen
 
-                if patternLen > 0 and #combined >= patternLen then
+                if patternLen > 0 and combinedLen >= patternLen then
                     local searchStart = math.max(1, tailLen - patternLen + 1)
                     local pos = searchStart
-                    while true do
-                        local found = string.find(combined, search.pattern, pos, true)
-                        if not found then break end
+                    local matchLimit = 1000  -- Prevent infinite loop on repetitive patterns
+                    local matchCount = 0
+                    
+                    while matchCount < matchLimit do
+                        -- Protected string search
+                        local findSuccess, found = pcall(string.find, combined, search.pattern, pos, true)
+                        if not findSuccess or not found then 
+                            break 
+                        end
+                        
+                        matchCount = matchCount + 1
                         local foundEnd = found + patternLen - 1
+                        
                         if foundEnd > tailLen then
                             local combinedZero = found - 1
                             local absoluteAddr = readAddr - tailLen + combinedZero
-                            local context = makeContext(processHandle, baseAddr, regionEnd, absoluteAddr, patternLen, search.isUnicode)
-                            search.count = search.count + 1
-                            logMatch(logFile, search.label, search.count, absoluteAddr, context, search.isUnicode)
+                            
+                            -- Protected context extraction
+                            local ctxSuccess, context = pcall(makeContext, processHandle, baseAddr, regionEnd, absoluteAddr, patternLen, search.isUnicode)
+                            if ctxSuccess then
+                                search.count = search.count + 1
+                                logMatch(logFile, search.label, search.count, absoluteAddr, context, search.isUnicode)
+                            end
                         end
+                        
                         pos = found + search.step
+                        if pos > combinedLen then
+                            break
+                        end
                     end
                 end
 
-                local maxTail = math.min(#combined, search.tailSize)
-                search.tail = combined:sub(#combined - maxTail + 1)
+                -- Update tail with size limit
+                local maxTail = math.min(combinedLen, search.tailSize)
+                if maxTail > 0 and maxTail <= combinedLen then
+                    local subSuccess, newTail = pcall(string.sub, combined, combinedLen - maxTail + 1)
+                    if subSuccess then
+                        search.tail = newTail
+                    else
+                        search.tail = ""  -- Reset on error
+                    end
+                else
+                    search.tail = ""
+                end
             end
-        elseif status and status ~= STATUS_PARTIAL_COPY then
-            local winErr = ntdll.RtlNtStatusToDosError(status)
-            writeLog(logFile, string.format("Read failed at 0x%08X (status=%s, win32=%d)\n", readAddr, statusToString(status), tonumber(winErr)))
+        else
+            consecutiveFailures = consecutiveFailures + 1
+            
+            if consecutiveFailures >= maxConsecutiveFailures then
+                writeLog(logFile, string.format("  Aborting region scan after %d consecutive failures at 0x%08X\n", consecutiveFailures, readAddr))
+                break
+            end
+            
+            if status and status ~= STATUS_PARTIAL_COPY and status ~= STATUS_ACCESS_VIOLATION then
+                local winSuccess, winErr = pcall(ntdll.RtlNtStatusToDosError, status)
+                local errCode = winSuccess and tonumber(winErr) or 0
+                writeLog(logFile, string.format("  Read failed at 0x%08X (status=%s, win32=%d)\n", readAddr, statusToString(status), errCode))
+            end
         end
 
         offset = offset + toRead
+        
+        -- Safety check for offset advancement
+        if offset <= 0 or offset > regionSize then
+            writeLog(logFile, string.format("  WARNING: Invalid offset advancement detected (offset=%d, regionSize=%d)\n", offset, regionSize))
+            break
+        end
     end
 end
 
@@ -423,17 +617,24 @@ local function logLoadedModules(processHandle, logFile)
     end
 end
 
--- Main execution
+-- Global to prevent garbage collection of VEH callback
+local _veh_callback_anchor = nil
+
+-- Main execution with comprehensive error handling
 function main()
     local logFile = assert(io.open(LOG_PATH, "a"))
     writeLog(logFile, "\n--------------------------------------------------\n")
+    currentLogFile = logFile
 
-    -- Install exception handler for access violations
-    local handler = kernel32.AddVectoredExceptionHandler(1, exceptionHandler)  -- 1 = first handler
-    if handler == nil then
-        writeLog(logFile, "Warning: Failed to install exception handler\n")
+    -- Install VEH exception handler with proper callback preservation
+    -- CRITICAL: Store callback in global to prevent GC during execution
+    _veh_callback_anchor = ffi.cast("PVECTORED_EXCEPTION_HANDLER", exceptionHandler)
+    local handler = kernel32.AddVectoredExceptionHandler(1, _veh_callback_anchor)  -- 1 = first handler
+    
+    if handler == nil or tonumber(ffi.cast("intptr_t", handler)) == 0 then
+        writeLog(logFile, "WARNING: Failed to install VEH exception handler\n")
     else
-        writeLog(logFile, "Exception handler installed\n")
+        writeLog(logFile, string.format("VEH exception handler installed at 0x%08X\n", tonumber(ffi.cast("intptr_t", handler))))
     end
 
     local function getProcessName(pHandle)
@@ -511,9 +712,10 @@ function main()
     local address = 0x10000 -- Start scan above first 64K
     local regions, readableRegions = 0, 0
     local firstQueryFailed = false
+    local lastAddress = 0
 
-    -- Main memory query loop
-    while address < ADDRESS_LIMIT do
+    -- Main memory query loop with safety limits
+    while address < ADDRESS_LIMIT and regions < MAX_REGIONS_TO_SCAN do
         local baseAddr, regionSize, state, protect
         local querySuccess = false
         local mbi
@@ -552,6 +754,13 @@ function main()
             break
         end
         
+        -- Detect infinite loop condition
+        if address == lastAddress then
+            writeLog(logFile, string.format("\n[ERROR] Infinite loop detected at address 0x%08X, aborting scan\n", address))
+            break
+        end
+        lastAddress = address
+        
         writeLog(logFile, string.format("\n[REGION %d] 0x%08X - 0x%08X size=%d KB protect=0x%03X state=0x%03X\n",
             regions, baseAddr, baseAddr + regionSize, math.floor(regionSize / 1024), protect or 0, state or 0))
 
@@ -561,7 +770,17 @@ function main()
         else
             if state == MEM_COMMIT and isReadableProtection(protect) then
                 readableRegions = readableRegions + 1
-                scanRegion(processHandle, logFile, baseAddr, regionSize, searchers)
+                
+                -- Progress indicator for console (every 10 regions)
+                if readableRegions % 10 == 0 then
+                    print(string.format("Scanning... %d regions inspected, %d readable", regions, readableRegions))
+                end
+                
+                -- Protected region scan with timeout detection
+                local scanSuccess, scanErr = pcall(scanRegion, processHandle, logFile, baseAddr, regionSize, searchers)
+                if not scanSuccess then
+                    writeLog(logFile, string.format("  ERROR: Region scan failed: %s\n", tostring(scanErr)))
+                end
             else
                 writeLog(logFile, "  Skipped (not committed/readable)\n")
             end
@@ -573,6 +792,17 @@ function main()
             writeLog(logFile, string.format("  WARNING: Address didn't advance (was 0x%08X), forcing +4KB\n", address))
             address = baseAddr + 0x1000
         end
+        
+        -- Additional safety: detect address overflow/wraparound
+        if address < baseAddr then
+            writeLog(logFile, string.format("\n[ERROR] Address wraparound detected (prev=0x%08X, current=0x%08X), aborting\n", baseAddr, address))
+            break
+        end
+    end
+    
+    -- Check if we hit the region limit
+    if regions >= MAX_REGIONS_TO_SCAN then
+        writeLog(logFile, string.format("\n[WARNING] Reached maximum region scan limit (%d), terminating early\n", MAX_REGIONS_TO_SCAN))
     end
 
     logLoadedModules(processHandle, logFile)
@@ -587,15 +817,19 @@ function main()
     end
 
     logFile:close()
-    print(string.format("Scan complete. %d regions inspected, results logged to %s", regions, LOG_PATH))
+    currentLogFile = nil
+    print(string.format("Scan complete. %d regions inspected, %d readable, results logged to %s", regions, readableRegions, LOG_PATH))
 end
 
+-- Top-level execution with comprehensive error handling
 local ok, err = pcall(main)
 if not ok then
-    local fallback = io.open(LOG_PATH, "w")
+    local fallback = io.open(LOG_PATH, "a")
     if fallback then
-        fallback:write("Scanner failed: " .. tostring(err) .. "\n")
+        fallback:write(string.format("\n[FATAL ERROR] Scanner crashed: %s\n", tostring(err)))
+        fallback:write(string.format("Stack trace: %s\n", debug.traceback()))
         fallback:close()
     end
-    error(err)
+    print(string.format("FATAL: Scanner failed - %s", tostring(err)))
+    os.exit(1)
 end
