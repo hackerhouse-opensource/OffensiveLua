@@ -114,7 +114,7 @@ local function initializeLogFile()
         local tempPath = getTempPath()
         local computerName = getComputerName()
         local timestamp = os.date("%Y%m%d_%H%M%S")
-        local logPath = string.format("%sWIN11LAB_WEBCAM_PICTURE_%s_%s.log", tempPath, sanitizedDeviceName, timestamp)
+        local logPath = string.format("%sWIN11LAB_WEBCAM_PICTURE_%s.log", tempPath, timestamp)
         
         LOG_HANDLE = kernel32.CreateFileA(
             logPath,
@@ -278,8 +278,8 @@ local function main()
     for _, device in ipairs(devices) do
         local timestamp = os.date("%Y%m%d_%H%M%S")
         local sanitizedDeviceName = device.name:gsub("[^%w%s%-_]", "_"):gsub("%s+", "_")
-        local logPath = string.format("%sWIN11LAB_WEBCAM_PICTURE_%s_%s.log", tempPath, sanitizedDeviceName, timestamp)
-        local outputPath = string.format("%s.bmp", logPath:match("(.-)%.log$"))
+        local logPath = string.format("%sWIN11LAB_WEBCAM_PICTURE_%s.log", tempPath, timestamp)
+        local outputPath = string.format("%sWIN11LAB_WEBCAM_PICTURE_%s_%s.bmp", tempPath, sanitizedDeviceName, timestamp)
         
         log(string.format("[*] Processing device %d: %s", device.index, device.name))
         local result = captureFromDevice(device.index, outputPath)
