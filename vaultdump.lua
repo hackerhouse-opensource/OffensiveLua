@@ -46,6 +46,14 @@ local CRYPTPROTECT_UI_FORBIDDEN = 0x01
 local CRYPTPROTECT_LOCAL_MACHINE = 0x04
 local CRYPTPROTECT_AUDIT = 0x10
 
+-- Common DPAPI error codes
+local ERROR_INVALID_DATA = 13  -- 0xD - The data is invalid
+local ERROR_INVALID_PARAMETER = 87  -- 0x57 - The parameter is incorrect
+local NTE_BAD_DATA = 0x80090005  -- Bad Data (wrong entropy, wrong user context, etc.)
+local NTE_BAD_KEY = 0x80090003  -- Bad Key
+local ERROR_NOT_SUPPORTED = 0x80070032  -- The request is not supported
+local ERROR_SUCCESS = 0
+
 -- Windows API Definitions
 ffi.cdef[[
     typedef unsigned long DWORD;
@@ -789,6 +797,61 @@ local function hexdump_full(data, label)
     return table.concat(result, "\n")
 end
 
+-- Analyze DPAPI blob structure
+local function analyze_dpapi_blob(data)
+    if not data or #data < 24 then
+        return "Blob too small to be valid DPAPI"
+    end
+    
+    local info = {}
+    
+    -- DPAPI blob structure:
+    -- 0x00-0x03: Version (should be 0x01000000)
+    -- 0x04-0x13: Provider GUID
+    -- 0x14-0x17: MasterKey version
+    -- 0x18-0x27: MasterKey GUID
+    -- 0x28+: Flags, description, and encrypted data
+    
+    -- Read version as little-endian DWORD (manually since string.unpack not in LuaJIT)
+    local b1, b2, b3, b4 = data:byte(1, 4)
+    local version = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+    
+    if version == 0x01000000 then
+        table.insert(info, "✓ Valid DPAPI blob (version 1)")
+    else
+        table.insert(info, string.format("✗ Invalid version: 0x%08X (expected 0x01000000)", version))
+    end
+    
+    -- Extract Provider GUID (bytes 4-19)
+    local provider_guid = {}
+    for i = 5, 20 do
+        table.insert(provider_guid, string.format("%02X", data:byte(i)))
+    end
+    table.insert(info, "Provider GUID: " .. table.concat(provider_guid, ""))
+    
+    -- Extract MasterKey GUID (bytes 24-39)
+    if #data >= 40 then
+        local mk_guid = {}
+        for i = 25, 40 do
+            table.insert(mk_guid, string.format("%02X", data:byte(i)))
+        end
+        table.insert(info, "MasterKey GUID: " .. table.concat(mk_guid, ""))
+    end
+    
+    -- Check for common indicators
+    table.insert(info, "")
+    table.insert(info, "Decryption Requirements:")
+    table.insert(info, "• User's master key must be available (user-specific)")
+    table.insert(info, "• If entropy was used, the SAME entropy must be provided")
+    table.insert(info, "• Application may use custom entropy stored in:")
+    table.insert(info, "  - Registry keys")
+    table.insert(info, "  - Configuration files")
+    table.insert(info, "  - Hardcoded in application binary")
+    table.insert(info, "  - Derived from username/machine name/SID")
+    
+    return table.concat(info, "\n")
+end
+
 local function filetime_to_string(ft)
     local low = tonumber(ft.dwLowDateTime)
     local high = tonumber(ft.dwHighDateTime)
@@ -910,7 +973,27 @@ local function dpapi_decrypt(encrypted_data, data_size, description)
             return decrypted, descr_str
         else
             local err = kernel32.GetLastError()
-            debug_log(string.format("DPAPI decryption FAILED with error: 0x%X", err))
+            local err_msg = "Unknown error"
+            
+            -- Translate common DPAPI error codes
+            if err == ERROR_INVALID_DATA or err == 0x8009000D then
+                err_msg = "ERROR_INVALID_DATA - Data format invalid or corrupted"
+            elseif err == ERROR_INVALID_PARAMETER then
+                err_msg = "ERROR_INVALID_PARAMETER - Invalid parameter"
+            elseif err == NTE_BAD_DATA then
+                err_msg = "NTE_BAD_DATA - Wrong entropy/salt, wrong user context, or data encrypted with additional secrets"
+            elseif err == NTE_BAD_KEY then
+                err_msg = "NTE_BAD_KEY - Decryption key not available"
+            elseif err == ERROR_NOT_SUPPORTED then
+                err_msg = "ERROR_NOT_SUPPORTED - Operation not supported with these flags"
+            end
+            
+            debug_log(string.format("DPAPI decryption FAILED with error: 0x%X - %s", err, err_msg))
+            
+            -- Only show hints for NTE_BAD_DATA (wrong entropy), not ERROR_INVALID_DATA (not DPAPI blob)
+            if err == NTE_BAD_DATA then
+                debug_log("  -> Likely cause: Application used custom entropy (salt) during encryption")
+            end
         end
     end
     
@@ -1505,7 +1588,8 @@ local function enumerate_vaults()
                                         local auth_val = get_vault_item_value(auth_elem.data)
                                         
                                         if auth_val then
-                                            debug_log(string.format("Authenticator value type: %s", type(auth_val)))
+                                            local auth_type = tonumber(auth_elem.data.dwType)
+                                            debug_log(string.format("Authenticator value type: %s, vault type: %d", type(auth_val), auth_type))
                                             
                                             if type(auth_val) == "table" and auth_val.type == "byte_array" then
                                                 debug_log(string.format("Authenticator is byte array (%d bytes), attempting DPAPI decryption...", auth_val.size))
@@ -1536,63 +1620,74 @@ local function enumerate_vaults()
                                                     debug_log("Password is encrypted byte array (DPAPI decryption failed) - buffer stored for analysis")
                                                 end
                                             else
-                                                -- Plain text password from vault
+                                                -- String password from vault
                                                 local pwd_str = tostring(auth_val)
                                                 debug_log(string.format("Got authenticator as string (%d chars)", #pwd_str))
                                                 
-                                                -- Check if it's base64-encoded DPAPI data (long string, likely encrypted)
-                                                -- DPAPI blobs are typically 100+ chars when base64 encoded
-                                                local is_likely_base64_dpapi = #pwd_str > 100 and pwd_str:match("^[A-Za-z0-9+/]+=*$")
+                                                -- Type 7 (Protected String) is ALREADY DECRYPTED by VaultGetItem
+                                                -- Do NOT try to DPAPI decrypt it again!
+                                                if auth_type == 7 then
+                                                    debug_log("Type 7 (Protected String) - already decrypted by Vault API")
+                                                    extracted_item.password = pwd_str
+                                                    extracted_item.password_decrypted = true
+                                                    log(string.format("[+] Successfully retrieved vault password for '%s' (Type 7 Protected String)", 
+                                                        extracted_item.friendly_name or extracted_item.resource or "vault item"))
+                                                    debug_log(string.format("Password (Type 7): %s", pwd_str))
+                                                else
+                                                    -- For other string types, check if it's base64-encoded DPAPI data
+                                                    -- DPAPI blobs are typically 100+ chars when base64 encoded
+                                                    local is_likely_base64_dpapi = #pwd_str > 100 and pwd_str:match("^[A-Za-z0-9+/]+=*$")
                                                 
-                                                if is_likely_base64_dpapi then
-                                                    log(string.format("[*] Password appears to be base64-encoded DPAPI blob (%d chars), attempting decode and decrypt...", #pwd_str))
-                                                    debug_log(string.format("Base64 string (first 100 chars): %s...", pwd_str:sub(1, 100)))
-                                                    
-                                                    -- Decode base64
-                                                    local decoded = decode_base64(pwd_str)
-                                                    if decoded and #decoded > 0 then
-                                                        debug_log(string.format("Base64 decoded to %d bytes", #decoded))
+                                                    if is_likely_base64_dpapi then
+                                                        log(string.format("[*] Password appears to be base64-encoded DPAPI blob (%d chars), attempting decode and decrypt...", #pwd_str))
+                                                        debug_log(string.format("Base64 string (first 100 chars): %s...", pwd_str:sub(1, 100)))
                                                         
-                                                        -- Log the decoded buffer in hex for analysis
-                                                        local hex_preview = {}
-                                                        for i = 1, math.min(32, #decoded) do
-                                                            table.insert(hex_preview, string.format("%02X", decoded:byte(i)))
-                                                        end
-                                                        debug_log(string.format("Decoded buffer (first 32 bytes): %s", table.concat(hex_preview, " ")))
-                                                        
-                                                        -- Try DPAPI decrypt on decoded data
-                                                        local dpapi_pwd, dpapi_desc = dpapi_decrypt(decoded, #decoded,
-                                                            extracted_item.friendly_name or extracted_item.resource or "vault_base64")
-                                                        
-                                                        if dpapi_pwd then
-                                                            extracted_item.password = dpapi_pwd
-                                                            extracted_item.password_decrypted = true
-                                                            if dpapi_desc then
-                                                                extracted_item.dpapi_description = dpapi_desc
+                                                        -- Decode base64
+                                                        local decoded = decode_base64(pwd_str)
+                                                        if decoded and #decoded > 0 then
+                                                            debug_log(string.format("Base64 decoded to %d bytes", #decoded))
+                                                            
+                                                            -- Log the decoded buffer in hex for analysis
+                                                            local hex_preview = {}
+                                                            for i = 1, math.min(32, #decoded) do
+                                                                table.insert(hex_preview, string.format("%02X", decoded:byte(i)))
                                                             end
-                                                            log(string.format("[+] Successfully decrypted base64 DPAPI password for '%s'", 
-                                                                extracted_item.friendly_name or extracted_item.resource or "vault item"))
-                                                            debug_log(string.format("Decrypted password: %s", dpapi_pwd))
+                                                            debug_log(string.format("Decoded buffer (first 32 bytes): %s", table.concat(hex_preview, " ")))
+                                                            
+                                                            -- Try DPAPI decrypt on decoded data
+                                                            local dpapi_pwd, dpapi_desc = dpapi_decrypt(decoded, #decoded,
+                                                                extracted_item.friendly_name or extracted_item.resource or "vault_base64")
+                                                            
+                                                            if dpapi_pwd then
+                                                                extracted_item.password = dpapi_pwd
+                                                                extracted_item.password_decrypted = true
+                                                                if dpapi_desc then
+                                                                    extracted_item.dpapi_description = dpapi_desc
+                                                                end
+                                                                log(string.format("[+] Successfully decrypted base64 DPAPI password for '%s'", 
+                                                                    extracted_item.friendly_name or extracted_item.resource or "vault item"))
+                                                                debug_log(string.format("Decrypted password: %s", dpapi_pwd))
+                                                            else
+                                                                -- DPAPI failed, store the encrypted buffer
+                                                                extracted_item.password_encrypted_base64 = pwd_str
+                                                                extracted_item.password_encrypted_binary = decoded
+                                                                extracted_item.password_size = #decoded
+                                                                extracted_item.password_decrypted = false
+                                                                log(string.format("[!] Base64 DPAPI decryption failed for vault item '%s' - storing encrypted data", 
+                                                                    extracted_item.friendly_name or extracted_item.resource or "vault item"))
+                                                                debug_log("Base64 decode succeeded but DPAPI decryption failed - encrypted buffer stored")
+                                                            end
                                                         else
-                                                            -- DPAPI failed, store the encrypted buffer
-                                                            extracted_item.password_encrypted_base64 = pwd_str
-                                                            extracted_item.password_encrypted_binary = decoded
-                                                            extracted_item.password_size = #decoded
+                                                            extracted_item.password = pwd_str
                                                             extracted_item.password_decrypted = false
-                                                            log(string.format("[!] Base64 DPAPI decryption failed for vault item '%s' - storing encrypted data", 
-                                                                extracted_item.friendly_name or extracted_item.resource or "vault item"))
-                                                            debug_log("Base64 decode succeeded but DPAPI decryption failed - encrypted buffer stored")
+                                                            debug_log("Base64 decode failed - storing as-is")
                                                         end
                                                     else
+                                                        -- Not base64 DPAPI, just a regular string password
                                                         extracted_item.password = pwd_str
                                                         extracted_item.password_decrypted = false
-                                                        debug_log("Base64 decode failed - storing as-is")
+                                                        debug_log(string.format("Got string password (not base64 DPAPI): %s", pwd_str))
                                                     end
-                                                else
-                                                    -- Plain text password
-                                                    extracted_item.password = pwd_str
-                                                    extracted_item.password_decrypted = false
-                                                    debug_log(string.format("Got plaintext password: %s", pwd_str))
                                                 end
                                             end
                                         else
@@ -1682,8 +1777,10 @@ local function display_credentials(credentials)
         
         if cred.password then
             log(string.format("  Password:     %s", cred.password))
-            log(string.format("  Decrypted:    %s", cred.decrypted and "Yes (DPAPI)" or "No (Plaintext)"))
+            -- Don't show "Decrypted: Yes (DPAPI)" - it's confusing when DPAPI failed
+            -- Only show DPAPI info if we have a description (meaning it actually decrypted)
             if cred.dpapi_description then
+                log(string.format("  Protection:   DPAPI (successfully decrypted)"))
                 log(string.format("  DPAPI Descr:  %s", cred.dpapi_description))
             end
             if cred.password_base64_decoded then
@@ -1794,6 +1891,15 @@ local function display_vaults(vaults)
                     if decoded and #decoded > 0 then
                         log(string.format("      Decoded (%d bytes):", #decoded))
                         
+                        -- Analyze DPAPI blob structure
+                        log("      ")
+                        log("      DPAPI Blob Analysis:")
+                        local blob_analysis = analyze_dpapi_blob(decoded)
+                        for line in blob_analysis:gmatch("[^\n]+") do
+                            log("        " .. line)
+                        end
+                        log("      ")
+                        
                         -- Full hex dump (no limit)
                         local hex_lines = hexdump_full(decoded, "      Encrypted (hex)")
                         for line in hex_lines:gmatch("[^\n]+") do
@@ -1838,8 +1944,13 @@ local function display_vaults(vaults)
                     log(string.format("      Password:     [%s - Error %s]", error_name, error_code))
                     log("      Note:         Application-restricted credential, run from app context to access")
                 else
-                    log("      Password:     [Not Available]")
-                    log("      Note:         No authenticator element found")
+                    -- Check if this is Windows Credentials (domain creds)
+                    if item.schema_id == "{77BC582B-F0A6-4E15-4E80-61736B6F3B29}" then
+                        log("      Password:     [Not Available - check LSA secrets]")
+                    else
+                        log("      Password:     [Not Available]")
+                        log("      Note:         No authenticator element found in vault item")
+                    end
                 end
                 
                 total_items = total_items + 1
