@@ -707,7 +707,10 @@ public:
 			printMemoryUsage();
 		}
 
-		printExecutionSummary();
+		if (config.countInstructions)
+		{
+			printExecutionSummary();
+		}
 	}
 
 	void dumpBytecodeFromStackIndex(int index, const std::string& description)

