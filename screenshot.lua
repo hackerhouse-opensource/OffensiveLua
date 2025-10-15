@@ -86,21 +86,48 @@ local function getScreenshotFilePath()
     return getTempPath() .. "\\" .. getComputerName() .. "_SCREENSHOT_" .. getFormattedTimestamp() .. ".bmp"
 end
 
+local function getLogFilePath()
+    return getTempPath() .. "\\" .. getComputerName() .. "_SCREENSHOT_" .. getFormattedTimestamp() .. ".log"
+end
+
+-- Log message to both file and stdout
+local logFile = nil
 local function logMsg(message)
     local timestamp = os.date("%Y-%m-%d %H:%M:%S")
-    print(timestamp .. " - " .. message)
+    local logMessage = timestamp .. " - " .. message
+    
+    -- Write to stdout
+    print(logMessage)
+    
+    -- Write to log file
+    if logFile then
+        logFile:write(logMessage .. "\n")
+        logFile:flush()  -- Ensure immediate write
+    end
 end
 
 -- Main screenshot capture function
 local function captureScreenshot()
     local outputFile = getScreenshotFilePath()
+    local logFilePath = getLogFilePath()
+    
+    -- Open log file
+    logFile = io.open(logFilePath, "w")
+    if not logFile then
+        print("ERROR: Failed to open log file: " .. logFilePath)
+        return
+    end
+    
     logMsg("Starting screenshot capture")
+    logMsg("Output file: " .. outputFile)
+    logMsg("Log file: " .. logFilePath)
 
     -- Get desktop window and DC
     local desktopWnd = user32.GetDesktopWindow()
     local desktopDC = user32.GetDC(desktopWnd)
     if desktopDC == nil then
         logMsg("ERROR: Failed to get desktop DC")
+        if logFile then logFile:close() end
         return
     end
 
@@ -120,6 +147,7 @@ local function captureScreenshot()
         gdi32.DeleteObject(hBitmap)
         gdi32.DeleteDC(memDC)
         user32.ReleaseDC(desktopWnd, desktopDC)
+        if logFile then logFile:close() end
         return
     end
     logMsg("Screen captured to bitmap")
@@ -156,6 +184,7 @@ local function captureScreenshot()
         gdi32.DeleteObject(hBitmap)
         gdi32.DeleteDC(memDC)
         user32.ReleaseDC(desktopWnd, desktopDC)
+        if logFile then logFile:close() end
         return
     end
     logMsg("Bitmap data retrieved: " .. imageSize .. " bytes")
@@ -190,6 +219,7 @@ local function captureScreenshot()
         gdi32.DeleteObject(hBitmap)
         gdi32.DeleteDC(memDC)
         user32.ReleaseDC(desktopWnd, desktopDC)
+        if logFile then logFile:close() end
         return
     end
 
@@ -211,6 +241,11 @@ local function captureScreenshot()
     gdi32.DeleteDC(memDC)
     user32.ReleaseDC(desktopWnd, desktopDC)
     logMsg("Resources cleaned up successfully")
+    
+    -- Close log file
+    if logFile then
+        logFile:close()
+    end
 end
 
 -- Run the screenshot capture
