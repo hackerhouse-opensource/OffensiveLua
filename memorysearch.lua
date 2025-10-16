@@ -14,12 +14,24 @@ local bit = require("bit")
 -- Lua pattern regex searches (case-insensitive)
 -- For hex byte sequences, use string.char() e.g. string.char(0x41, 0x42, 0x43, 0x44) for ABCD
 local REGEX_PATTERNS = {
-    { pattern = "[Uu][Ss][Ee][Rr]", description = "user" },
+    -- { pattern = "[Uu][Ss][Ee][Rr]", description = "user" },
     { pattern = "[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]", description = "password" },
-    { pattern = "[Kk][Ee][Yy]", description = "key" },
-    { pattern = "[Ss][Ee][Cc][Rr][Ee][Tt]", description = "secret" },
-    { pattern = "[Tt][Oo][Kk][Ee][Nn]", description = "token" },
-    { pattern = "[Pp][Ii][Nn]", description = "PIN" },
+    -- { pattern = "[Kk][Ee][Yy]", description = "key" },
+    -- { pattern = "[Ss][Ee][Cc][Rr][Ee][Tt]", description = "secret" },
+    -- { pattern = "[Tt][Oo][Kk][Ee][Nn]", description = "token" },
+    -- { pattern = "[Pp][Ii][Nn]", description = "PIN" },
+    
+    -- Base64 Pattern: Matches base64-encoded strings (minimum 20 characters for meaningful data)
+    -- Pattern matches: [A-Za-z0-9+/]{20,} with optional = or == padding
+    -- This will find strings like: SGVsbG8gV29ybGQh or dXNlcjpwYXNzd29yZA==
+    { pattern = "[A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/=]*", description = "base64 (20+ chars)" },
+    
+    -- Alternative: Shorter base64 strings (minimum 8 characters)
+    -- { pattern = "[A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/=]*", description = "base64 (8+ chars)" },
+    
+    -- Base64 with common prefixes (API keys, tokens, etc.)
+    -- { pattern = "[Aa][Pp][Ii][Kk][Ee][Yy]%s*[:=]%s*[A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/=]*", description = "API key (base64)" },
+    -- { pattern = "[Tt][Oo][Kk][Ee][Nn]%s*[:=]%s*[A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/][A-Za-z0-9+/=]*", description = "token (base64)" },
     
     -- Binary/hex byte sequence examples (isPlain = true for exact byte matching)
     -- { pattern = string.char(0x30, 0x82), description = "RSA private key (DER)", isPlain = true },
@@ -300,6 +312,75 @@ local function safeRead(processHandle, address, size)
     return strResult, true
 end
 
+-- Extract printable ASCII strings from binary data
+local function extractStrings(data, minLength)
+    minLength = minLength or 4  -- Minimum string length to extract
+    local strings = {}
+    local currentString = {}
+    local currentStart = nil
+    
+    for i = 1, #data do
+        local byte = data:byte(i)
+        -- Check if printable ASCII (space to ~)
+        if byte >= 32 and byte <= 126 then
+            if not currentStart then
+                currentStart = i
+            end
+            table.insert(currentString, string.char(byte))
+        else
+            -- Non-printable character, end current string if long enough
+            if #currentString >= minLength then
+                table.insert(strings, {
+                    offset = currentStart - 1,
+                    value = table.concat(currentString)
+                })
+            end
+            currentString = {}
+            currentStart = nil
+        end
+    end
+    
+    -- Don't forget the last string if it ends at data end
+    if #currentString >= minLength then
+        table.insert(strings, {
+            offset = currentStart - 1,
+            value = table.concat(currentString)
+        })
+    end
+    
+    return strings
+end
+
+-- Format extracted strings for display
+local function formatExtractedStrings(data, baseAddr, highlightOffset, highlightLen)
+    local strings = extractStrings(data, 4)
+    if #strings == 0 then
+        return "  (No printable strings found)\n"
+    end
+    
+    local lines = {}
+    local highlightEnd = highlightOffset + highlightLen
+    
+    for _, str in ipairs(strings) do
+        local strEnd = str.offset + #str.value
+        local addr = baseAddr + str.offset
+        
+        -- Check if this string contains or overlaps with the match
+        local isMatch = (str.offset >= highlightOffset and str.offset < highlightEnd) or
+                       (strEnd > highlightOffset and strEnd <= highlightEnd) or
+                       (str.offset <= highlightOffset and strEnd >= highlightEnd)
+        
+        if isMatch then
+            -- This string contains the match - highlight it
+            table.insert(lines, string.format("  [MATCH] 0x%08X: %s", addr, str.value))
+        else
+            table.insert(lines, string.format("  0x%08X: %s", addr, str.value))
+        end
+    end
+    
+    return table.concat(lines, "\n") .. "\n"
+end
+
 local function hexdump(data, baseAddr, highlightOffset, highlightLen)
     local lines = {}
     local total = #data
@@ -468,6 +549,8 @@ local function logMatch(logFile, label, idx, address, contextInfo, isUnicode)
         writeLog(logFile, "Context Hexdump:\n")
         writeLog(logFile, hexdump(contextInfo.data, contextInfo.base, contextInfo.highlightOffset, contextInfo.highlightLen))
         writeLog(logFile, "\n")
+        writeLog(logFile, "Extracted Strings:\n")
+        writeLog(logFile, formatExtractedStrings(contextInfo.data, contextInfo.base, contextInfo.highlightOffset, contextInfo.highlightLen))
     else
         writeLog(logFile, "Context unavailable (access denied)\n")
     end

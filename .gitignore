@@ -443,3 +443,8 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Entropy list files (contain sensitive extracted strings)
+entropy.list
+*_STRINGDUMP_*.txt
+*_STRINGDUMP_*.log
