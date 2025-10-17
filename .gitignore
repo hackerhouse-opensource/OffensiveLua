@@ -448,3 +448,6 @@ FodyWeavers.xsd
 entropy.list
 *_STRINGDUMP_*.txt
 *_STRINGDUMP_*.log
+
+# DPAPI
+.\vaultdump-dataprotectionexploit.lua
