@@ -450,4 +450,4 @@ entropy.list
 *_STRINGDUMP_*.log
 
 # DPAPI
-.\vaultdump-dataprotectionexploit.lua
+vaultdump-dataprotectionexploit.lua
