@@ -1,7 +1,5 @@
 # Offensive Lua
 
-# Offensive Lua
-
 Offensive Lua is a comprehensive collection of offensive security and red team scripts written in Lua with FFI (Foreign Function Interface). These scripts leverage the power and flexibility of LuaJIT on Microsoft Windows to perform advanced penetration testing and red teaming operations.
 
 ## Key Capabilities
