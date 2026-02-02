@@ -113,4 +113,4 @@ You can learn more about Hacker House and Offensive Lua at our website:
 
 # License
 
-These files are available under a Attribution-NonCommercial-NoDerivatives 4.0 International license.
+These files are available under the 3-clause BSD license.
